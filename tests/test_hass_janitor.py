@@ -1,0 +1,835 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+import json
+import os
+from pathlib import Path
+import tempfile
+from typing import Any
+from unittest import TestCase, mock
+
+from hass_janitor import cli
+from hass_janitor.audit import render_audit_entry
+from hass_janitor.client import HAAuthError, HAConnectionError, HAResponseError
+from hass_janitor.models import RestartResult, RunSummary
+from hass_janitor.runner import UpdateRunner, discover_updates, order_updates
+
+
+def build_state(
+    entity_id: str,
+    state: str,
+    *,
+    title: str | None = None,
+    friendly_name: str | None = None,
+    installed_version: str | None = None,
+    latest_version: str | None = None,
+) -> dict[str, Any]:
+    attributes: dict[str, Any] = {}
+    if title is not None:
+        attributes["title"] = title
+    if friendly_name is not None:
+        attributes["friendly_name"] = friendly_name
+    if installed_version is not None:
+        attributes["installed_version"] = installed_version
+    if latest_version is not None:
+        attributes["latest_version"] = latest_version
+
+    return {
+        "entity_id": entity_id,
+        "state": state,
+        "attributes": attributes,
+        "last_changed": "2026-04-18T18:00:00-04:00",
+        "last_updated": "2026-04-18T18:00:00-04:00",
+    }
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.current = datetime(2026, 4, 18, 18, 0, 0, tzinfo=timezone.utc)
+
+    def now(self) -> datetime:
+        return self.current
+
+    def sleep(self, seconds: float) -> None:
+        self.current += timedelta(seconds=seconds)
+
+
+class FakeClient:
+    def __init__(
+        self,
+        *,
+        initial_states: list[dict[str, Any]],
+        install_errors: dict[str, Exception] | None = None,
+        poll_sequences: dict[str, list[Any]] | None = None,
+        restart_error: Exception | None = None,
+        health_sequence: list[Any] | None = None,
+        list_states_sequence: list[Any] | None = None,
+    ) -> None:
+        self.base_url = "https://example.ui.nabu.casa"
+        self.initial_states = initial_states
+        self.install_errors = install_errors or {}
+        self.poll_sequences = {
+            key: list(value) for key, value in (poll_sequences or {}).items()
+        }
+        self.restart_error = restart_error
+        self.health_sequence = list(health_sequence or [])
+        self.list_states_sequence = list(list_states_sequence or [initial_states])
+        self.install_calls: list[str] = []
+        self.restart_calls = 0
+
+    def health_check(self) -> dict[str, str]:
+        if self.health_sequence:
+            outcome = self.health_sequence.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+        return {"message": "API running."}
+
+    def list_states(self) -> list[dict[str, Any]]:
+        if self.list_states_sequence:
+            outcome = self.list_states_sequence.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        return []
+
+    def install_update(self, entity_id: str) -> list[Any]:
+        self.install_calls.append(entity_id)
+        outcome = self.install_errors.get(entity_id)
+        if outcome is not None:
+            raise outcome
+        return []
+
+    def get_state(self, entity_id: str) -> dict[str, Any]:
+        queue = self.poll_sequences[entity_id]
+        outcome = queue.pop(0) if len(queue) > 1 else queue[0]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def restart_home_assistant(self) -> list[Any]:
+        self.restart_calls += 1
+        if self.restart_error is not None:
+            raise self.restart_error
+        return []
+
+
+class FakeHTTPResponse:
+    def __init__(self, payload: Any) -> None:
+        self.payload = payload
+        self.headers = {"Content-Type": "application/json"}
+
+    def read(self) -> bytes:
+        return json.dumps(self.payload).encode("utf-8")
+
+    def __enter__(self) -> "FakeHTTPResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+def fake_urlopen_factory(expected_calls: list[tuple[str, str, Any]]) -> Any:
+    remaining = list(expected_calls)
+
+    def fake_urlopen(request, timeout=30):
+        if not remaining:
+            raise AssertionError("Unexpected extra HTTP request")
+
+        method, suffix, payload = remaining.pop(0)
+        if request.method != method:
+            raise AssertionError(f"Expected {method}, got {request.method}")
+        if not request.full_url.endswith(suffix):
+            raise AssertionError(f"Expected URL ending with {suffix}, got {request.full_url}")
+
+        if isinstance(payload, Exception):
+            raise payload
+        return FakeHTTPResponse(payload)
+
+    return fake_urlopen
+
+
+@contextmanager
+def temporary_cwd() -> Path:
+    original = Path.cwd()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        os.chdir(tmpdir)
+        try:
+            yield Path(tmpdir)
+        finally:
+            os.chdir(original)
+
+
+class DiscoveryTests(TestCase):
+    def test_discover_updates_only_returns_on_update_entities(self) -> None:
+        states = [
+            build_state(
+                "update.zigbee2mqtt",
+                "on",
+                title="Zigbee2MQTT",
+                installed_version="1.0.0",
+                latest_version="1.1.0",
+            ),
+            build_state("update.already_done", "off", title="Already Done"),
+            build_state("sensor.temperature", "on", friendly_name="Temp"),
+        ]
+
+        updates = discover_updates(states)
+
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0].entity_id, "update.zigbee2mqtt")
+        self.assertEqual(updates[0].name, "Zigbee2MQTT")
+        self.assertEqual(updates[0].installed_version, "1.0.0")
+        self.assertEqual(updates[0].latest_version, "1.1.0")
+
+    def test_order_updates_puts_system_updates_last(self) -> None:
+        updates = discover_updates(
+            [
+                build_state(
+                    "update.home_assistant_core_update",
+                    "on",
+                    title="Home Assistant Core",
+                    installed_version="2026.4.0",
+                    latest_version="2026.4.1",
+                ),
+                build_state(
+                    "update.z_wave_js_ui",
+                    "on",
+                    title="Z-Wave JS UI",
+                    installed_version="3.0.0",
+                    latest_version="3.0.1",
+                ),
+                build_state(
+                    "update.home_assistant_supervisor_update",
+                    "on",
+                    title="Home Assistant Supervisor",
+                    installed_version="2026.04.0",
+                    latest_version="2026.04.1",
+                ),
+            ]
+        )
+
+        ordered = order_updates(updates)
+
+        self.assertEqual(
+            [item.entity_id for item in ordered],
+            [
+                "update.z_wave_js_ui",
+                "update.home_assistant_supervisor_update",
+                "update.home_assistant_core_update",
+            ],
+        )
+
+
+class AuditRenderingTests(TestCase):
+    def test_render_audit_entry_for_no_updates(self) -> None:
+        timestamp = datetime(2026, 4, 18, 18, 0, tzinfo=timezone.utc)
+        summary = RunSummary(
+            started_at=timestamp,
+            finished_at=timestamp,
+            base_url="https://example.ui.nabu.casa",
+            notes="No updates found.",
+        )
+
+        rendered = render_audit_entry(summary)
+
+        self.assertIn("No updates found.", rendered)
+        self.assertIn("| _No updates_ |", rendered)
+        self.assertIn("example.ui.nabu.casa", rendered)
+
+
+class RunnerFlowTests(TestCase):
+    def test_preflight_discovers_updates_without_installing_or_restarting(self) -> None:
+        clock = FakeClock()
+        initial_states = [
+            build_state(
+                "update.z_wave_js_ui",
+                "on",
+                title="Z-Wave JS UI",
+                installed_version="3.0.0",
+                latest_version="3.0.1",
+            ),
+            build_state(
+                "update.home_assistant_core_update",
+                "on",
+                title="Home Assistant Core",
+                installed_version="2026.4.0",
+                latest_version="2026.4.1",
+            ),
+        ]
+        client = FakeClient(initial_states=initial_states)
+
+        summary = UpdateRunner(
+            client,
+            base_url=client.base_url,
+            now_func=clock.now,
+            sleep_func=clock.sleep,
+        ).preflight()
+
+        self.assertEqual(summary.exit_code, 0)
+        self.assertEqual(summary.mode, "preflight")
+        self.assertEqual(summary.discovered_count, 2)
+        self.assertEqual(summary.attempted_count, 0)
+        self.assertEqual(client.install_calls, [])
+        self.assertEqual(client.restart_calls, 0)
+        self.assertEqual(
+            [attempt.entity_id for attempt in summary.updates],
+            ["update.z_wave_js_ui", "update.home_assistant_core_update"],
+        )
+        self.assertTrue(all(attempt.result == "planned" for attempt in summary.updates))
+
+    def test_dry_run_discovers_updates_without_installing_or_restarting(self) -> None:
+        clock = FakeClock()
+        initial_states = [
+            build_state(
+                "update.z_wave_js_ui",
+                "on",
+                title="Z-Wave JS UI",
+                installed_version="3.0.0",
+                latest_version="3.0.1",
+            ),
+            build_state(
+                "update.home_assistant_core_update",
+                "on",
+                title="Home Assistant Core",
+                installed_version="2026.4.0",
+                latest_version="2026.4.1",
+            ),
+        ]
+        client = FakeClient(initial_states=initial_states)
+
+        summary = UpdateRunner(
+            client,
+            base_url=client.base_url,
+            now_func=clock.now,
+            sleep_func=clock.sleep,
+        ).dry_run()
+
+        self.assertEqual(summary.exit_code, 0)
+        self.assertEqual(summary.mode, "dry-run")
+        self.assertEqual(summary.discovered_count, 2)
+        self.assertEqual(summary.attempted_count, 0)
+        self.assertEqual(client.install_calls, [])
+        self.assertEqual(client.restart_calls, 0)
+        self.assertEqual(
+            [attempt.entity_id for attempt in summary.updates],
+            ["update.z_wave_js_ui", "update.home_assistant_core_update"],
+        )
+        self.assertTrue(all(attempt.result == "dry_run" for attempt in summary.updates))
+
+    def test_all_updates_succeed_and_restart_recovers(self) -> None:
+        clock = FakeClock()
+        initial_states = [
+            build_state(
+                "update.z_wave_js_ui",
+                "on",
+                title="Z-Wave JS UI",
+                installed_version="3.0.0",
+                latest_version="3.0.1",
+            ),
+            build_state(
+                "update.home_assistant_core_update",
+                "on",
+                title="Home Assistant Core",
+                installed_version="2026.4.0",
+                latest_version="2026.4.1",
+            ),
+        ]
+        client = FakeClient(
+            initial_states=initial_states,
+            poll_sequences={
+                "update.z_wave_js_ui": [
+                    build_state(
+                        "update.z_wave_js_ui",
+                        "off",
+                        title="Z-Wave JS UI",
+                        installed_version="3.0.1",
+                        latest_version="3.0.1",
+                    )
+                ],
+                "update.home_assistant_core_update": [
+                    build_state(
+                        "update.home_assistant_core_update",
+                        "on",
+                        title="Home Assistant Core",
+                        installed_version="2026.4.1",
+                        latest_version="2026.4.1",
+                    )
+                ],
+            },
+            health_sequence=[None, HAConnectionError("booting"), None],
+            list_states_sequence=[initial_states, []],
+        )
+
+        summary = UpdateRunner(
+            client,
+            base_url=client.base_url,
+            now_func=clock.now,
+            sleep_func=clock.sleep,
+            poll_interval_seconds=10,
+            restart_timeout_seconds=30,
+        ).run()
+
+        self.assertEqual(summary.exit_code, 0)
+        self.assertEqual(summary.succeeded_count, 2)
+        self.assertEqual(summary.restart.result, "succeeded")
+        self.assertEqual(
+            client.install_calls,
+            ["update.z_wave_js_ui", "update.home_assistant_core_update"],
+        )
+
+    def test_one_update_failure_does_not_stop_later_updates(self) -> None:
+        clock = FakeClock()
+        initial_states = [
+            build_state(
+                "update.broken_addon",
+                "on",
+                title="Broken Add-on",
+                installed_version="1.0.0",
+                latest_version="1.1.0",
+            ),
+            build_state(
+                "update.good_addon",
+                "on",
+                title="Good Add-on",
+                installed_version="2.0.0",
+                latest_version="2.1.0",
+            ),
+        ]
+        client = FakeClient(
+            initial_states=initial_states,
+            install_errors={
+                "update.broken_addon": HAResponseError(400, "Bad request")
+            },
+            poll_sequences={
+                "update.good_addon": [
+                    build_state(
+                        "update.good_addon",
+                        "on",
+                        title="Good Add-on",
+                        installed_version="2.1.0",
+                        latest_version="2.1.0",
+                    )
+                ]
+            },
+            list_states_sequence=[initial_states, []],
+        )
+
+        summary = UpdateRunner(
+            client,
+            base_url=client.base_url,
+            now_func=clock.now,
+            sleep_func=clock.sleep,
+            restart_timeout_seconds=30,
+        ).run()
+
+        self.assertEqual(summary.exit_code, 1)
+        self.assertEqual(summary.succeeded_count, 1)
+        self.assertEqual(summary.failed_count, 1)
+        self.assertEqual(
+            client.install_calls,
+            ["update.broken_addon", "update.good_addon"],
+        )
+        self.assertEqual(summary.restart.result, "succeeded")
+
+    def test_install_request_connection_error_can_still_resolve_as_success(self) -> None:
+        clock = FakeClock()
+        initial_states = [
+            build_state(
+                "update.matter_server_update",
+                "on",
+                title="Matter Server",
+                installed_version="8.2.2",
+                latest_version="8.4.0",
+            ),
+            build_state(
+                "update.terminal_ssh_update",
+                "on",
+                title="Terminal & SSH",
+                installed_version="10.0.0",
+                latest_version="10.1.0",
+            ),
+        ]
+        client = FakeClient(
+            initial_states=initial_states,
+            install_errors={
+                "update.matter_server_update": HAConnectionError("read timed out")
+            },
+            poll_sequences={
+                "update.matter_server_update": [
+                    build_state(
+                        "update.matter_server_update",
+                        "off",
+                        title="Matter Server",
+                        installed_version="8.4.0",
+                        latest_version="8.4.0",
+                    )
+                ],
+                "update.terminal_ssh_update": [
+                    build_state(
+                        "update.terminal_ssh_update",
+                        "off",
+                        title="Terminal & SSH",
+                        installed_version="10.1.0",
+                        latest_version="10.1.0",
+                    )
+                ],
+            },
+            list_states_sequence=[initial_states, []],
+        )
+
+        summary = UpdateRunner(
+            client,
+            base_url=client.base_url,
+            now_func=clock.now,
+            sleep_func=clock.sleep,
+            restart_timeout_seconds=30,
+        ).run()
+
+        self.assertEqual(summary.exit_code, 0)
+        self.assertEqual(summary.succeeded_count, 2)
+        self.assertEqual(
+            [attempt.entity_id for attempt in summary.updates],
+            ["update.matter_server_update", "update.terminal_ssh_update"],
+        )
+        self.assertEqual(client.install_calls, ["update.matter_server_update", "update.terminal_ssh_update"])
+
+    def test_update_timeout_is_recorded(self) -> None:
+        clock = FakeClock()
+        initial_states = [
+            build_state(
+                "update.slow_addon",
+                "on",
+                title="Slow Add-on",
+                installed_version="1.0.0",
+                latest_version="1.1.0",
+            )
+        ]
+        client = FakeClient(
+            initial_states=initial_states,
+            poll_sequences={
+                "update.slow_addon": [
+                    build_state(
+                        "update.slow_addon",
+                        "on",
+                        title="Slow Add-on",
+                        installed_version="1.0.0",
+                        latest_version="1.1.0",
+                    )
+                ]
+            },
+            list_states_sequence=[initial_states, []],
+        )
+
+        summary = UpdateRunner(
+            client,
+            base_url=client.base_url,
+            now_func=clock.now,
+            sleep_func=clock.sleep,
+            poll_interval_seconds=5,
+            install_timeout_seconds=15,
+            restart_timeout_seconds=30,
+        ).run()
+
+        self.assertEqual(summary.exit_code, 1)
+        self.assertEqual(summary.timed_out_count, 1)
+        self.assertEqual(summary.restart.result, "succeeded")
+
+    def test_initial_auth_failure_returns_exit_code_two(self) -> None:
+        clock = FakeClock()
+        client = FakeClient(
+            initial_states=[],
+            health_sequence=[HAAuthError("Invalid token")],
+        )
+
+        summary = UpdateRunner(
+            client,
+            base_url=client.base_url,
+            now_func=clock.now,
+            sleep_func=clock.sleep,
+        ).run()
+
+        self.assertEqual(summary.exit_code, 2)
+        self.assertIn("Initial authentication failed", summary.notes)
+
+    def test_restart_timeout_is_reported(self) -> None:
+        clock = FakeClock()
+        initial_states = [
+            build_state(
+                "update.good_addon",
+                "on",
+                title="Good Add-on",
+                installed_version="2.0.0",
+                latest_version="2.1.0",
+            )
+        ]
+        client = FakeClient(
+            initial_states=initial_states,
+            poll_sequences={
+                "update.good_addon": [
+                    build_state(
+                        "update.good_addon",
+                        "off",
+                        title="Good Add-on",
+                        installed_version="2.1.0",
+                        latest_version="2.1.0",
+                    )
+                ]
+            },
+            health_sequence=[
+                None,
+                HAConnectionError("still booting"),
+                HAConnectionError("still booting"),
+                HAConnectionError("still booting"),
+            ],
+        )
+
+        summary = UpdateRunner(
+            client,
+            base_url=client.base_url,
+            now_func=clock.now,
+            sleep_func=clock.sleep,
+            poll_interval_seconds=5,
+            restart_timeout_seconds=15,
+        ).run()
+
+        self.assertEqual(summary.exit_code, 1)
+        self.assertEqual(summary.restart.result, "timed_out")
+
+
+class CliSmokeTests(TestCase):
+    def test_cli_main_dry_run_loads_credentials_from_dotenv(self) -> None:
+        expected_calls = [
+            ("GET", "/api/", {"message": "API running."}),
+            (
+                "GET",
+                "/api/states",
+                [
+                    build_state(
+                        "update.example_addon",
+                        "on",
+                        title="Example Add-on",
+                        installed_version="1.0.0",
+                        latest_version="1.1.0",
+                    )
+                ],
+            ),
+        ]
+
+        with temporary_cwd() as tmpdir:
+            (tmpdir / ".env").write_text(
+                "\n".join(
+                    [
+                        "HA_BASE_URL=https://example.ui.nabu.casa",
+                        "HA_TOKEN=test-token",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch("hass_janitor.client.urlopen", fake_urlopen_factory(expected_calls)),
+            ):
+                exit_code = cli.main(["dry-run"])
+
+            audit_path = tmpdir / "logs" / "ha-update-audit.md"
+            audit_exists = audit_path.exists()
+            audit_contents = (
+                audit_path.read_text(encoding="utf-8") if audit_exists else ""
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(audit_exists)
+        self.assertIn("Mode: `dry-run`", audit_contents)
+        self.assertIn("Example Add-on", audit_contents)
+
+    def test_cli_main_prefers_environment_over_dotenv(self) -> None:
+        expected_calls = [
+            ("GET", "/api/", {"message": "API running."}),
+            (
+                "GET",
+                "/api/states",
+                [
+                    build_state(
+                        "update.example_addon",
+                        "on",
+                        title="Example Add-on",
+                        installed_version="1.0.0",
+                        latest_version="1.1.0",
+                    )
+                ],
+            ),
+        ]
+
+        with temporary_cwd() as tmpdir:
+            (tmpdir / ".env").write_text(
+                "\n".join(
+                    [
+                        "HA_BASE_URL=https://wrong.example",
+                        "HA_TOKEN=wrong-token",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            env = {
+                "HA_TOKEN": "test-token",
+                "HA_BASE_URL": "https://example.ui.nabu.casa",
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch("hass_janitor.client.urlopen", fake_urlopen_factory(expected_calls)),
+            ):
+                exit_code = cli.main(["dry-run"])
+
+        self.assertEqual(exit_code, 0)
+
+    def test_cli_main_dry_run_writes_audit_log_without_mutation_calls(self) -> None:
+        expected_calls = [
+            ("GET", "/api/", {"message": "API running."}),
+            (
+                "GET",
+                "/api/states",
+                [
+                    build_state(
+                        "update.example_addon",
+                        "on",
+                        title="Example Add-on",
+                        installed_version="1.0.0",
+                        latest_version="1.1.0",
+                    )
+                ],
+            ),
+        ]
+
+        with temporary_cwd() as tmpdir:
+            env = {
+                "HA_TOKEN": "test-token",
+                "HA_BASE_URL": "https://example.ui.nabu.casa",
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch("hass_janitor.client.urlopen", fake_urlopen_factory(expected_calls)),
+            ):
+                exit_code = cli.main(["dry-run"])
+
+            audit_path = tmpdir / "logs" / "ha-update-audit.md"
+            audit_exists = audit_path.exists()
+            audit_contents = (
+                audit_path.read_text(encoding="utf-8") if audit_exists else ""
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(audit_exists)
+        self.assertIn("Mode: `dry-run`", audit_contents)
+        self.assertIn("Dry run only. No install request was sent.", audit_contents)
+
+    def test_cli_main_run_without_confirm_only_writes_preflight_audit(self) -> None:
+        expected_calls = [
+            ("GET", "/api/", {"message": "API running."}),
+            (
+                "GET",
+                "/api/states",
+                [
+                    build_state(
+                        "update.example_addon",
+                        "on",
+                        title="Example Add-on",
+                        installed_version="1.0.0",
+                        latest_version="1.1.0",
+                    )
+                ],
+            ),
+        ]
+
+        with temporary_cwd() as tmpdir:
+            env = {
+                "HA_TOKEN": "test-token",
+                "HA_BASE_URL": "https://example.ui.nabu.casa",
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch("hass_janitor.client.urlopen", fake_urlopen_factory(expected_calls)),
+            ):
+                exit_code = cli.main(["run"])
+
+            audit_path = tmpdir / "logs" / "ha-update-audit.md"
+            audit_exists = audit_path.exists()
+            audit_contents = (
+                audit_path.read_text(encoding="utf-8") if audit_exists else ""
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(audit_exists)
+        self.assertIn("Mode: `preflight`", audit_contents)
+        self.assertIn("Preflight only. Run with --confirm to install.", audit_contents)
+
+    def test_cli_main_runs_and_writes_audit_log(self) -> None:
+        expected_calls = [
+            ("GET", "/api/", {"message": "API running."}),
+            (
+                "GET",
+                "/api/states",
+                [
+                    build_state(
+                        "update.example_addon",
+                        "on",
+                        title="Example Add-on",
+                        installed_version="1.0.0",
+                        latest_version="1.1.0",
+                    )
+                ],
+            ),
+            ("GET", "/api/", {"message": "API running."}),
+            (
+                "GET",
+                "/api/states",
+                [
+                    build_state(
+                        "update.example_addon",
+                        "on",
+                        title="Example Add-on",
+                        installed_version="1.0.0",
+                        latest_version="1.1.0",
+                    )
+                ],
+            ),
+            ("POST", "/api/services/update/install", []),
+            (
+                "GET",
+                "/api/states/update.example_addon",
+                build_state(
+                    "update.example_addon",
+                    "off",
+                    title="Example Add-on",
+                    installed_version="1.1.0",
+                    latest_version="1.1.0",
+                ),
+            ),
+            ("POST", "/api/services/homeassistant/restart", []),
+            ("GET", "/api/", {"message": "API running."}),
+            ("GET", "/api/states", []),
+        ]
+
+        with temporary_cwd() as tmpdir:
+            env = {
+                "HA_TOKEN": "test-token",
+                "HA_BASE_URL": "https://example.ui.nabu.casa",
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch("hass_janitor.client.urlopen", fake_urlopen_factory(expected_calls)),
+                mock.patch("hass_janitor.runner.time.sleep", lambda _: None),
+                ):
+                exit_code = cli.main(["run", "--confirm"])
+
+            audit_path = tmpdir / "logs" / "ha-update-audit.md"
+            audit_exists = audit_path.exists()
+            audit_contents = (
+                audit_path.read_text(encoding="utf-8") if audit_exists else ""
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(audit_exists)
+        self.assertIn("Example Add-on", audit_contents)
