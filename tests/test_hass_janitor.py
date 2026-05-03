@@ -16,6 +16,12 @@ from urllib.request import Request, urlopen
 from hass_janitor import cli
 from hass_janitor.audit import render_audit_entry
 from hass_janitor.client import HAAuthError, HAConnectionError, HAResponseError
+from hass_janitor.monitor import (
+    JanitorMonitor,
+    MonitorConfig,
+    parse_ha_datetime,
+    summarize_update_event,
+)
 from hass_janitor.models import RestartResult, RunSummary
 from hass_janitor.runner import UpdateRunner, discover_updates, order_updates
 from hass_janitor.service import Handler, parse_mode
@@ -152,6 +158,26 @@ def fake_urlopen_factory(expected_calls: list[tuple[str, str, Any]]) -> Any:
         return FakeHTTPResponse(payload)
 
     return fake_urlopen
+
+
+class MonitorFakeClient(FakeClient):
+    def __init__(
+        self,
+        *,
+        backup_state: str,
+        initial_states: list[dict[str, Any]],
+    ) -> None:
+        super().__init__(initial_states=initial_states)
+        self.backup_state = backup_state
+
+    def get_state(self, entity_id: str) -> dict[str, Any]:
+        if entity_id == "event.backup_automatic_backup":
+            return {
+                "entity_id": entity_id,
+                "state": self.backup_state,
+                "attributes": {"event_type": "completed"},
+            }
+        return super().get_state(entity_id)
 
 
 @contextmanager
@@ -910,3 +936,100 @@ class ServiceTests(TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         return server, thread
+
+
+class MonitorTests(TestCase):
+    def test_parse_ha_datetime_handles_home_assistant_timestamp(self) -> None:
+        parsed = parse_ha_datetime("2026-04-29T18:29:55.576+00:00")
+
+        self.assertEqual(parsed.year, 2026)
+        self.assertEqual(parsed.tzinfo, timezone.utc)
+
+    def test_summarize_update_event_includes_release_fields(self) -> None:
+        summary = summarize_update_event(
+            "update.home_assistant_core_update",
+            {
+                "state": "on",
+                "attributes": {
+                    "title": "Home Assistant Core",
+                    "installed_version": "2026.2.1",
+                    "latest_version": "2026.4.4",
+                    "release_summary": "Important changes.",
+                    "release_url": "https://example.com/release",
+                },
+                "last_changed": "2026-05-02T01:57:30+00:00",
+            },
+        )
+
+        self.assertEqual(summary["entity_id"], "update.home_assistant_core_update")
+        self.assertEqual(summary["release_summary"], "Important changes.")
+        self.assertEqual(summary["release_url"], "https://example.com/release")
+
+    def test_check_once_blocks_when_backup_is_stale(self) -> None:
+        notifications: list[dict[str, Any]] = []
+        client = MonitorFakeClient(
+            backup_state="2026-04-01T18:29:55.576+00:00",
+            initial_states=[
+                build_state(
+                    "update.home_assistant_core_update",
+                    "on",
+                    title="Home Assistant Core",
+                    installed_version="2026.2.1",
+                    latest_version="2026.4.4",
+                )
+            ],
+        )
+        monitor = JanitorMonitor(
+            self._monitor_config(),
+            client_factory=lambda: client,
+            notify_func=lambda title, message, **kwargs: notifications.append(
+                {"title": title, "message": message, **kwargs}
+            )
+            or {"status": "sent"},
+        )
+
+        summary = monitor.check_once(reason="test")
+
+        self.assertEqual(summary.discovered_count, 1)
+        self.assertEqual(notifications[0]["title"], "Home Assistant update blocked")
+        self.assertIn("no fresh backup", notifications[0]["message"])
+
+    def test_check_once_sends_confirmation_when_backup_is_fresh(self) -> None:
+        notifications: list[dict[str, Any]] = []
+        client = MonitorFakeClient(
+            backup_state=datetime.now(timezone.utc).isoformat(),
+            initial_states=[
+                build_state(
+                    "update.home_assistant_core_update",
+                    "on",
+                    title="Home Assistant Core",
+                    installed_version="2026.2.1",
+                    latest_version="2026.4.4",
+                )
+            ],
+        )
+        monitor = JanitorMonitor(
+            self._monitor_config(),
+            client_factory=lambda: client,
+            notify_func=lambda title, message, **kwargs: notifications.append(
+                {"title": title, "message": message, **kwargs}
+            )
+            or {"status": "sent"},
+        )
+
+        summary = monitor.check_once(reason="test")
+
+        self.assertEqual(summary.discovered_count, 1)
+        self.assertEqual(notifications[0]["title"], "Home Assistant updates available")
+        self.assertEqual(notifications[0]["buttons"][0]["title"], "Update now")
+
+    def _monitor_config(self) -> MonitorConfig:
+        return MonitorConfig(
+            ha_base_url="https://example.ui.nabu.casa",
+            ha_token="ha-token",
+            audit_path=Path(os.devnull),
+            backup_entity_id="event.backup_automatic_backup",
+            backup_max_age_days=7,
+            check_interval_seconds=86400,
+            notification_cooldown_seconds=21600,
+        )

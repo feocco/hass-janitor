@@ -20,6 +20,8 @@ Small Home Assistant update runner with audit logging.
 - `python -m hass_janitor.service`
   - runs a small authenticated HTTP wrapper for deployed homelab use
   - exposes `/health` and `POST /v1/home-assistant/update`
+  - listens for Home Assistant update state changes and mobile notification actions
+  - blocks update prompts when the configured backup timestamp is older than 7 days
 
 ## Setup
 
@@ -28,6 +30,7 @@ Small Home Assistant update runner with audit logging.
    - `HA_BASE_URL`
    - `HA_TOKEN`
    - `HASS_JANITOR_API_TOKEN` when running the HTTP service
+   - `HOMELAB_FUNCTIONS_URL` and `HOMELAB_FUNCTIONS_TOKEN` for phone notifications
 
 The CLI loads `.env` from the repo root automatically.
 
@@ -50,6 +53,11 @@ curl -X POST http://localhost:8092/v1/home-assistant/update `
   -H "Content-Type: application/json" `
   -d "{\"mode\":\"preflight\"}"
 ```
+
+The deployed service also runs a monitor by default. It subscribes to Home
+Assistant `state_changed` events, logs summarized `update.*` payloads, checks
+backup freshness, and sends Joe a confirmation notification before running
+updates.
 
 ## Notes
 

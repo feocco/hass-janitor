@@ -8,16 +8,19 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
 from .audit import append_audit_log
 from .client import HomeAssistantClient
+from .monitor import JanitorMonitor, MonitorConfig
 from .runner import UpdateRunner
 
 
 DEFAULT_AUDIT_PATH = Path("/app/logs/ha-update-audit.md")
+LOGGER = logging.getLogger("hass-janitor")
 
 
 class ConfigError(RuntimeError):
@@ -32,6 +35,18 @@ class Config:
         self.service_host = os.environ.get("SERVICE_HOST", "0.0.0.0")
         self.service_port = int(os.environ.get("SERVICE_PORT", "8092"))
         self.audit_path = Path(os.environ.get("AUDIT_PATH", str(DEFAULT_AUDIT_PATH)))
+        self.monitor_enabled = env_bool("HASS_JANITOR_MONITOR_ENABLED", default=True)
+        self.backup_entity_id = os.environ.get(
+            "HASS_JANITOR_BACKUP_ENTITY_ID",
+            "event.backup_automatic_backup",
+        )
+        self.backup_max_age_days = int(os.environ.get("HASS_JANITOR_BACKUP_MAX_AGE_DAYS", "7"))
+        self.check_interval_seconds = int(
+            os.environ.get("HASS_JANITOR_CHECK_INTERVAL_SECONDS", str(24 * 60 * 60))
+        )
+        self.notification_cooldown_seconds = int(
+            os.environ.get("HASS_JANITOR_NOTIFICATION_COOLDOWN_SECONDS", str(6 * 60 * 60))
+        )
 
 
 def required_env(name: str) -> str:
@@ -39,6 +54,13 @@ def required_env(name: str) -> str:
     if not value:
         raise ConfigError(f"{name} is required")
     return value
+
+
+def env_bool(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -181,8 +203,24 @@ def to_jsonable(value: Any) -> Any:
 def main() -> None:
     load_dotenv()
     config = Config()
+    logging.basicConfig(level=logging.INFO)
     server = ThreadingHTTPServer((config.service_host, config.service_port), Handler)
     server.config = config  # type: ignore[attr-defined]
+    monitor = None
+    if config.monitor_enabled:
+        monitor = JanitorMonitor(
+            MonitorConfig(
+                ha_base_url=config.ha_base_url,
+                ha_token=config.ha_token,
+                audit_path=config.audit_path,
+                backup_entity_id=config.backup_entity_id,
+                backup_max_age_days=config.backup_max_age_days,
+                check_interval_seconds=config.check_interval_seconds,
+                notification_cooldown_seconds=config.notification_cooldown_seconds,
+            )
+        )
+        monitor.start()
+        LOGGER.info("hass-janitor monitor started")
     print(
         f"hass-janitor listening on {config.service_host}:{config.service_port}",
         flush=True,
@@ -192,6 +230,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        if monitor is not None:
+            monitor.stop()
         server.server_close()
 
 

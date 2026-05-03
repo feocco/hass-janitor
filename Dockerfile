@@ -2,6 +2,9 @@ FROM python:3.13-alpine
 
 WORKDIR /app
 
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
 COPY hass_janitor /app/hass_janitor
 
 ENV SERVICE_HOST=0.0.0.0

@@ -1,0 +1,2 @@
+aiohttp>=3.9,<4
+homelab-functions @ https://github.com/feocco/homelab-functions/archive/refs/heads/main.zip
