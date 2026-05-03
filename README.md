@@ -17,6 +17,9 @@ Small Home Assistant update runner with audit logging.
   - polls each entity for completion
   - performs one restart at the end if any install was accepted
   - waits for the Home Assistant API to come back
+- `python -m hass_janitor.service`
+  - runs a small authenticated HTTP wrapper for deployed homelab use
+  - exposes `/health` and `POST /v1/home-assistant/update`
 
 ## Setup
 
@@ -24,6 +27,7 @@ Small Home Assistant update runner with audit logging.
 2. Fill in:
    - `HA_BASE_URL`
    - `HA_TOKEN`
+   - `HASS_JANITOR_API_TOKEN` when running the HTTP service
 
 The CLI loads `.env` from the repo root automatically.
 
@@ -33,7 +37,18 @@ The CLI loads `.env` from the repo root automatically.
 python -m hass_janitor dry-run
 python -m hass_janitor run
 python -m hass_janitor run --confirm
+python -m hass_janitor.service
 python -m unittest discover -s tests -v
+```
+
+HTTP service examples:
+
+```powershell
+curl http://localhost:8092/health
+curl -X POST http://localhost:8092/v1/home-assistant/update `
+  -H "Authorization: Bearer $env:HASS_JANITOR_API_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d "{\"mode\":\"preflight\"}"
 ```
 
 ## Notes

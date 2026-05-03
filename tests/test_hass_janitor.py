@@ -2,18 +2,23 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from http.server import ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 from typing import Any
 from unittest import TestCase, mock
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from hass_janitor import cli
 from hass_janitor.audit import render_audit_entry
 from hass_janitor.client import HAAuthError, HAConnectionError, HAResponseError
 from hass_janitor.models import RestartResult, RunSummary
 from hass_janitor.runner import UpdateRunner, discover_updates, order_updates
+from hass_janitor.service import Handler, parse_mode
 
 
 def build_state(
@@ -833,3 +838,75 @@ class CliSmokeTests(TestCase):
         self.assertEqual(exit_code, 0)
         self.assertTrue(audit_exists)
         self.assertIn("Example Add-on", audit_contents)
+
+
+class ServiceTests(TestCase):
+    def test_parse_mode_requires_confirm_for_run(self) -> None:
+        self.assertEqual(parse_mode({}), "preflight")
+        self.assertEqual(parse_mode({"mode": "dry-run"}), "dry-run")
+        with self.assertRaisesRegex(ValueError, "confirm must be true"):
+            parse_mode({"mode": "run"})
+        self.assertEqual(parse_mode({"mode": "run", "confirm": True}), "run")
+
+    def test_service_rejects_missing_auth(self) -> None:
+        server, thread = self._start_server()
+        try:
+            request = Request(
+                f"http://127.0.0.1:{server.server_port}/v1/home-assistant/update",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(request, timeout=2)
+
+            self.assertEqual(raised.exception.code, 401)
+            raised.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_service_runs_preflight_with_auth(self) -> None:
+        server, thread = self._start_server()
+        summary = RunSummary(
+            started_at=datetime(2026, 4, 18, 18, 0, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 4, 18, 18, 1, tzinfo=timezone.utc),
+            base_url="https://example.ui.nabu.casa",
+            mode="preflight",
+            notes="No updates found.",
+        )
+        try:
+            with mock.patch("hass_janitor.service.run_update", return_value=summary) as run_update:
+                request = Request(
+                    f"http://127.0.0.1:{server.server_port}/v1/home-assistant/update",
+                    data=json.dumps({"mode": "preflight"}).encode("utf-8"),
+                    headers={
+                        "Authorization": "Bearer secret",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urlopen(request, timeout=2) as response:
+                    payload = json.loads(response.read())
+
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["mode"], "preflight")
+            run_update.assert_called_once()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def _start_server(self):
+        class Config:
+            ha_base_url = "https://example.ui.nabu.casa"
+            ha_token = "ha-token"
+            api_token = "secret"
+            audit_path = Path("logs/ha-update-audit.md")
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.config = Config()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, thread
