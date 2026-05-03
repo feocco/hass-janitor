@@ -21,6 +21,7 @@ from hass_janitor.monitor import (
     MonitorConfig,
     parse_ha_datetime,
     summarize_update_event,
+    update_event_signature,
 )
 from hass_janitor.models import RestartResult, RunSummary
 from hass_janitor.runner import UpdateRunner, discover_updates, order_updates
@@ -964,6 +965,21 @@ class MonitorTests(TestCase):
         self.assertEqual(summary["entity_id"], "update.home_assistant_core_update")
         self.assertEqual(summary["release_summary"], "Important changes.")
         self.assertEqual(summary["release_url"], "https://example.com/release")
+
+    def test_update_event_signature_ignores_timestamp_only_changes(self) -> None:
+        first = {
+            "entity_id": "update.example",
+            "state": "on",
+            "installed_version": "1.0.0",
+            "latest_version": "1.1.0",
+            "in_progress": True,
+            "release_summary": None,
+            "release_url": None,
+            "last_updated": "2026-05-03T02:00:00+00:00",
+        }
+        second = {**first, "last_updated": "2026-05-03T02:00:01+00:00"}
+
+        self.assertEqual(update_event_signature(first), update_event_signature(second))
 
     def test_state_changed_ignores_duplicate_and_in_progress_events(self) -> None:
         monitor = JanitorMonitor(

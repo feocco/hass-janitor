@@ -220,9 +220,13 @@ class JanitorMonitor:
             return
 
         log_payload = summarize_update_event(entity_id, new_state)
-        event_signature = json.dumps(log_payload, sort_keys=True, default=str)
+        event_signature = update_event_signature(log_payload)
         if self._last_event_signature_by_entity.get(entity_id) == event_signature:
-            LOGGER.debug("Duplicate Home Assistant update state_changed: %s", event_signature)
+            LOGGER.debug(
+                "Duplicate Home Assistant update state_changed signature for %s: %s",
+                entity_id,
+                event_signature,
+            )
             return
         self._last_event_signature_by_entity[entity_id] = event_signature
         LOGGER.info("Home Assistant update state_changed: %s", json.dumps(log_payload, sort_keys=True))
@@ -400,3 +404,16 @@ def summarize_update_event(entity_id: str, new_state: dict[str, Any]) -> dict[st
         "last_changed": new_state.get("last_changed"),
         "last_updated": new_state.get("last_updated"),
     }
+
+
+def update_event_signature(log_payload: dict[str, Any]) -> str:
+    meaningful = {
+        "entity_id": log_payload.get("entity_id"),
+        "state": log_payload.get("state"),
+        "installed_version": log_payload.get("installed_version"),
+        "latest_version": log_payload.get("latest_version"),
+        "in_progress": log_payload.get("in_progress"),
+        "release_summary": log_payload.get("release_summary"),
+        "release_url": log_payload.get("release_url"),
+    }
+    return json.dumps(meaningful, sort_keys=True, default=str)
