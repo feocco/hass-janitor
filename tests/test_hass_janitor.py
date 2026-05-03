@@ -965,6 +965,64 @@ class MonitorTests(TestCase):
         self.assertEqual(summary["release_summary"], "Important changes.")
         self.assertEqual(summary["release_url"], "https://example.com/release")
 
+    def test_state_changed_ignores_duplicate_and_in_progress_events(self) -> None:
+        monitor = JanitorMonitor(
+            self._monitor_config(),
+            client_factory=lambda: MonitorFakeClient(
+                backup_state=datetime.now(timezone.utc).isoformat(),
+                initial_states=[],
+            ),
+            notify_func=lambda title, message, **kwargs: {"status": "sent"},
+        )
+        calls = []
+        monitor.check_once = lambda *, reason: calls.append(reason)  # type: ignore[method-assign]
+        event = {
+            "entity_id": "update.example",
+            "new_state": {
+                "state": "on",
+                "attributes": {
+                    "title": "Example",
+                    "installed_version": "1.0.0",
+                    "latest_version": "1.1.0",
+                    "in_progress": True,
+                },
+            },
+        }
+
+        monitor.handle_state_changed(event)
+        monitor.handle_state_changed(event)
+
+        self.assertEqual(calls, [])
+
+    def test_state_changed_checks_once_for_distinct_available_update(self) -> None:
+        monitor = JanitorMonitor(
+            self._monitor_config(),
+            client_factory=lambda: MonitorFakeClient(
+                backup_state=datetime.now(timezone.utc).isoformat(),
+                initial_states=[],
+            ),
+            notify_func=lambda title, message, **kwargs: {"status": "sent"},
+        )
+        calls = []
+        monitor.check_once = lambda *, reason: calls.append(reason)  # type: ignore[method-assign]
+        event = {
+            "entity_id": "update.example",
+            "new_state": {
+                "state": "on",
+                "attributes": {
+                    "title": "Example",
+                    "installed_version": "1.0.0",
+                    "latest_version": "1.1.0",
+                    "in_progress": False,
+                },
+            },
+        }
+
+        monitor.handle_state_changed(event)
+        monitor.handle_state_changed(event)
+
+        self.assertEqual(calls, ["state_changed:update.example"])
+
     def test_check_once_blocks_when_backup_is_stale(self) -> None:
         notifications: list[dict[str, Any]] = []
         client = MonitorFakeClient(

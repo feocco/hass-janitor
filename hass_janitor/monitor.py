@@ -64,6 +64,7 @@ class JanitorMonitor:
         self._last_signature = ""
         self._last_notification_at: datetime | None = None
         self._pending_confirmation = False
+        self._last_event_signature_by_entity: dict[str, str] = {}
 
     def start(self) -> None:
         if self._thread is not None:
@@ -219,9 +220,17 @@ class JanitorMonitor:
             return
 
         log_payload = summarize_update_event(entity_id, new_state)
+        event_signature = json.dumps(log_payload, sort_keys=True, default=str)
+        if self._last_event_signature_by_entity.get(entity_id) == event_signature:
+            LOGGER.debug("Duplicate Home Assistant update state_changed: %s", event_signature)
+            return
+        self._last_event_signature_by_entity[entity_id] = event_signature
         LOGGER.info("Home Assistant update state_changed: %s", json.dumps(log_payload, sort_keys=True))
 
         if new_state.get("state") != "on":
+            return
+        if (new_state.get("attributes") or {}).get("in_progress"):
+            LOGGER.info("Skipping update prompt while %s is already in progress", entity_id)
             return
 
         try:
