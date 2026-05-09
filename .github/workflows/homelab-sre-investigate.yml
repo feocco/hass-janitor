@@ -1,0 +1,55 @@
+name: Homelab SRE Investigate
+
+on:
+  repository_dispatch:
+    types: [homelab-sre-investigate]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+jobs:
+  codex:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          safety-strategy: drop-sudo
+          sandbox: workspace-write
+          prompt: |
+            Investigate homelab SRE issue #${{ github.event.client_payload.issue_number }}.
+
+            Context:
+            - Issue URL: ${{ github.event.client_payload.issue_url }}
+            - Service: ${{ github.event.client_payload.service_name }}
+            - Container: ${{ github.event.client_payload.container_name }}
+            - Fingerprint: ${{ github.event.client_payload.fingerprint }}
+            - Deployment repo: ${{ github.event.client_payload.deployment_repo }}
+            - Deployment path: ${{ github.event.client_payload.deployment_path }}
+
+            Requirements:
+            - Inspect the relevant code and tests.
+            - Make the smallest plausible fix.
+            - Add or update focused tests when possible.
+            - Do not change unrelated behavior.
+            - Summarize root cause, fix, and verification in the final response.
+
+      - name: Create draft pull request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: codex/sre-${{ github.event.client_payload.issue_number }}-${{ github.event.client_payload.fingerprint }}
+          title: "SRE: investigate issue #${{ github.event.client_payload.issue_number }}"
+          body: |
+            Automated draft PR for homelab SRE issue #${{ github.event.client_payload.issue_number }}.
+
+            Fingerprint: `${{ github.event.client_payload.fingerprint }}`
+            Service: `${{ github.event.client_payload.service_name }}`
+            Container: `${{ github.event.client_payload.container_name }}`
+            Issue: ${{ github.event.client_payload.issue_url }}
+          draft: true
