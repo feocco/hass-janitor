@@ -630,6 +630,26 @@ class RunnerFlowTests(TestCase):
 
 
 class CliSmokeTests(TestCase):
+    def test_cli_main_requires_ha_base_url(self) -> None:
+        with temporary_cwd() as tmpdir:
+            with (
+                mock.patch.dict(os.environ, {"HA_TOKEN": "test-token"}, clear=True),
+                mock.patch("hass_janitor.client.urlopen") as urlopen_mock,
+            ):
+                exit_code = cli.main(["dry-run"])
+
+            audit_path = tmpdir / "logs" / "ha-update-audit.md"
+            audit_exists = audit_path.exists()
+            audit_contents = (
+                audit_path.read_text(encoding="utf-8") if audit_exists else ""
+            )
+
+        self.assertEqual(exit_code, 2)
+        urlopen_mock.assert_not_called()
+        self.assertTrue(audit_exists)
+        self.assertIn("HA_BASE_URL is required.", audit_contents)
+        self.assertIn("Base URL host: `unset`", audit_contents)
+
     def test_cli_main_dry_run_loads_credentials_from_dotenv(self) -> None:
         expected_calls = [
             ("GET", "/api/", {"message": "API running."}),

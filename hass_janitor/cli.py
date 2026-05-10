@@ -13,9 +13,6 @@ from .client import HomeAssistantClient
 from .models import RunSummary
 from .runner import UpdateRunner
 
-DEFAULT_BASE_URL = (
-    "https://your-instance.ui.nabu.casa"
-)
 DEFAULT_ENV_PATH = Path(".env")
 DEFAULT_AUDIT_PATH = Path("logs/ha-update-audit.md")
 
@@ -55,14 +52,8 @@ def main(argv: list[str] | None = None) -> int:
 def run_command(*, confirm: bool) -> int:
     """Run the janitor once using environment-based configuration."""
 
-    base_url = os.environ.get("HA_BASE_URL", DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
-    token = os.environ.get("HA_TOKEN", "").strip()
-
-    if not token:
-        summary = _configuration_error_summary(
-            base_url=base_url,
-            message="HA_TOKEN is required.",
-        )
+    base_url, token, summary = _load_runtime_config()
+    if summary is not None:
         append_audit_log(DEFAULT_AUDIT_PATH, summary)
         print(summary.notes, file=sys.stderr)
         return summary.exit_code
@@ -98,15 +89,8 @@ def run_command(*, confirm: bool) -> int:
 def dry_run_command() -> int:
     """Run discovery only and record what would be updated."""
 
-    base_url = os.environ.get("HA_BASE_URL", DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
-    token = os.environ.get("HA_TOKEN", "").strip()
-
-    if not token:
-        summary = _configuration_error_summary(
-            base_url=base_url,
-            message="HA_TOKEN is required.",
-            mode="dry-run",
-        )
+    base_url, token, summary = _load_runtime_config(mode="dry-run")
+    if summary is not None:
         append_audit_log(DEFAULT_AUDIT_PATH, summary)
         print(summary.notes, file=sys.stderr)
         return summary.exit_code
@@ -116,6 +100,35 @@ def dry_run_command() -> int:
     append_audit_log(DEFAULT_AUDIT_PATH, summary)
     print(_console_summary(summary), file=sys.stdout)
     return summary.exit_code
+
+
+def _load_runtime_config(*, mode: str = "run") -> tuple[str, str, RunSummary | None]:
+    base_url = os.environ.get("HA_BASE_URL", "").strip()
+    token = os.environ.get("HA_TOKEN", "").strip()
+
+    if not base_url:
+        return (
+            base_url,
+            token,
+            _configuration_error_summary(
+                base_url="unset",
+                message="HA_BASE_URL is required.",
+                mode=mode,
+            ),
+        )
+
+    if not token:
+        return (
+            base_url,
+            token,
+            _configuration_error_summary(
+                base_url=base_url,
+                message="HA_TOKEN is required.",
+                mode=mode,
+            ),
+        )
+
+    return base_url, token, None
 
 
 def _configuration_error_summary(
