@@ -960,6 +960,44 @@ class ServiceTests(TestCase):
 
 
 class MonitorTests(TestCase):
+    def test_default_notify_function_is_loaded_lazily(self) -> None:
+        with mock.patch.object(JanitorMonitor, "_load_notify_func") as load_notify_func:
+            monitor = JanitorMonitor(
+                self._monitor_config(),
+                client_factory=lambda: MonitorFakeClient(
+                    backup_state=datetime.now(timezone.utc).isoformat(),
+                    initial_states=[],
+                ),
+            )
+
+        load_notify_func.assert_not_called()
+        self.assertTrue(callable(monitor.notify_func))
+
+    def test_default_notify_function_failure_is_logged(self) -> None:
+        monitor = JanitorMonitor(
+            self._monitor_config(),
+            client_factory=lambda: MonitorFakeClient(
+                backup_state=datetime.now(timezone.utc).isoformat(),
+                initial_states=[],
+            ),
+        )
+
+        with (
+            mock.patch.object(
+                monitor,
+                "_load_notify_func",
+                side_effect=ModuleNotFoundError("No module named 'homelab'"),
+            ),
+            self.assertLogs("hass-janitor.monitor", level="WARNING") as logs,
+        ):
+            result = monitor.notify_func("Title", "Message")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn(
+            "Failed to send Home Assistant update notification",
+            logs.output[0],
+        )
+
     def test_parse_ha_datetime_handles_home_assistant_timestamp(self) -> None:
         parsed = parse_ha_datetime("2026-04-29T18:29:55.576+00:00")
 
