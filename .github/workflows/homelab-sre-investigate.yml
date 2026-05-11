@@ -38,6 +38,29 @@ jobs:
               --repo "${{ github.repository }}" \
               --comments
           } > .codex/homelab-sre-context.md
+          {
+            echo "## Issue"
+            echo
+            echo "Closes ${{ github.event.client_payload.issue_url }}."
+            echo
+            echo "This draft PR was opened by the homelab SRE workflow. Codex did not replace the fallback PR body."
+            echo
+            echo "## Root Cause"
+            echo
+            echo "- Not documented by Codex."
+            echo
+            echo "## Fix"
+            echo
+            echo "- Not documented by Codex."
+            echo
+            echo "## Validation"
+            echo
+            echo "- Not documented by Codex."
+            echo
+            echo "## Risk"
+            echo
+            echo "- Review the diff carefully before merge."
+          } > .codex/sre-pr-body.md
 
       - name: Run Codex
         uses: openai/codex-action@v1
@@ -67,6 +90,11 @@ jobs:
             - Make the smallest plausible fix.
             - Add or update focused tests when possible.
             - Do not change unrelated behavior.
+            - Update `.codex/sre-pr-body.md` with a PR description specific to the issue and actual diff.
+            - In the PR description, include `## Issue`, `## Root Cause`, `## Fix`, `## Validation`, and `## Risk`.
+            - For bugs, explain the faulty logic and how the fix changes that logic.
+            - For features, tools, or config changes, explain why the change is needed and what behavior it adds or changes.
+            - Do not leave generic "Automated draft PR" text in the PR description.
             - Summarize root cause, fix, and verification in the final response.
 
       - name: Create draft pull request
@@ -75,11 +103,5 @@ jobs:
           token: ${{ secrets.SRE_GITHUB_TOKEN }}
           branch: codex/sre-${{ github.event.client_payload.issue_number }}-${{ github.event.client_payload.fingerprint }}
           title: "SRE: investigate issue #${{ github.event.client_payload.issue_number }}"
-          body: |
-            Automated draft PR for homelab SRE issue #${{ github.event.client_payload.issue_number }}.
-
-            Fingerprint: `${{ github.event.client_payload.fingerprint }}`
-            Service: `${{ github.event.client_payload.service_name }}`
-            Container: `${{ github.event.client_payload.container_name }}`
-            Issue: ${{ github.event.client_payload.issue_url }}
+          body-path: .codex/sre-pr-body.md
           draft: true
