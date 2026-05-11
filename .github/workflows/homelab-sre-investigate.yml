@@ -4,104 +4,22 @@ on:
   repository_dispatch:
     types: [homelab-sre-investigate]
 
-permissions:
-  contents: write
-  pull-requests: write
-  issues: read
-
 jobs:
-  codex:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Fetch SRE issue context
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p .codex
-          echo ".codex/" >> .git/info/exclude
-          {
-            echo "# Homelab SRE Context"
-            echo
-            echo "- Issue URL: ${{ github.event.client_payload.issue_url }}"
-            echo "- Service: ${{ github.event.client_payload.service_name }}"
-            echo "- Container: ${{ github.event.client_payload.container_name }}"
-            echo "- Fingerprint: ${{ github.event.client_payload.fingerprint }}"
-            echo "- State fingerprint: ${{ github.event.client_payload.state_fingerprint }}"
-            echo "- Deployment repo: ${{ github.event.client_payload.deployment_repo }}"
-            echo "- Deployment path: ${{ github.event.client_payload.deployment_path }}"
-            echo
-            echo "## Issue"
-            gh issue view "${{ github.event.client_payload.issue_number }}" \
-              --repo "${{ github.repository }}" \
-              --comments
-          } > .codex/homelab-sre-context.md
-          {
-            echo "## Issue"
-            echo
-            echo "Closes ${{ github.event.client_payload.issue_url }}."
-            echo
-            echo "This draft PR was opened by the homelab SRE workflow. Codex did not replace the fallback PR body."
-            echo
-            echo "## Root Cause"
-            echo
-            echo "- Not documented by Codex."
-            echo
-            echo "## Fix"
-            echo
-            echo "- Not documented by Codex."
-            echo
-            echo "## Validation"
-            echo
-            echo "- Not documented by Codex."
-            echo
-            echo "## Risk"
-            echo
-            echo "- Review the diff carefully before merge."
-          } > .codex/sre-pr-body.md
-
-      - name: Run Codex
-        uses: openai/codex-action@v1
-        with:
-          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          model: gpt-5.5
-          effort: medium
-          safety-strategy: drop-sudo
-          sandbox: workspace-write
-          prompt: |
-            Investigate homelab SRE issue #${{ github.event.client_payload.issue_number }}.
-
-            Context:
-            - Issue URL: ${{ github.event.client_payload.issue_url }}
-            - Service: ${{ github.event.client_payload.service_name }}
-            - Container: ${{ github.event.client_payload.container_name }}
-            - Fingerprint: ${{ github.event.client_payload.fingerprint }}
-            - State fingerprint: ${{ github.event.client_payload.state_fingerprint }}
-            - Deployment repo: ${{ github.event.client_payload.deployment_repo }}
-            - Deployment path: ${{ github.event.client_payload.deployment_path }}
-
-            Requirements:
-            - Read `.codex/homelab-sre-context.md` before changing code.
-            - Start from the SRE context and use targeted code search.
-            - Do not scan the whole repo unless the evidence requires it.
-            - Inspect the relevant code and tests.
-            - Make the smallest plausible fix.
-            - Add or update focused tests when possible.
-            - Do not change unrelated behavior.
-            - Update `.codex/sre-pr-body.md` with a PR description specific to the issue and actual diff.
-            - In the PR description, include `## Issue`, `## Root Cause`, `## Fix`, `## Validation`, and `## Risk`.
-            - For bugs, explain the faulty logic and how the fix changes that logic.
-            - For features, tools, or config changes, explain why the change is needed and what behavior it adds or changes.
-            - Do not leave generic "Automated draft PR" text in the PR description.
-            - Summarize root cause, fix, and verification in the final response.
-
-      - name: Create draft pull request
-        uses: peter-evans/create-pull-request@v6
-        with:
-          token: ${{ secrets.SRE_GITHUB_TOKEN }}
-          branch: codex/sre-${{ github.event.client_payload.issue_number }}-${{ github.event.client_payload.fingerprint }}
-          title: "SRE: investigate issue #${{ github.event.client_payload.issue_number }}"
-          body-path: .codex/sre-pr-body.md
-          draft: true
+  homelab-sre-codex:
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: read
+    uses: feocco/homelab-sre-agent/.github/workflows/homelab-sre-codex.yml@main
+    with:
+      issue_number: ${{ github.event.client_payload.issue_number }}
+      issue_url: ${{ github.event.client_payload.issue_url }}
+      service_name: ${{ github.event.client_payload.service_name }}
+      container_name: ${{ github.event.client_payload.container_name }}
+      fingerprint: ${{ github.event.client_payload.fingerprint }}
+      state_fingerprint: ${{ github.event.client_payload.state_fingerprint }}
+      deployment_repo: ${{ github.event.client_payload.deployment_repo }}
+      deployment_path: ${{ github.event.client_payload.deployment_path }}
+    secrets:
+      openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+      sre-github-token: ${{ secrets.SRE_GITHUB_TOKEN }}
