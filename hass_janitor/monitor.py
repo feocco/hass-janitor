@@ -58,7 +58,8 @@ class JanitorMonitor:
                 token=config.ha_token,
             )
         )
-        self.notify_func = notify_func or self._load_notify_func()
+        self.notify_func = notify_func or self._notify_via_homelab
+        self._loaded_notify_func: Callable[..., dict[str, Any]] | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_signature = ""
@@ -361,6 +362,15 @@ class JanitorMonitor:
         from homelab import notify_joe
 
         return notify_joe
+
+    def _notify_via_homelab(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        try:
+            if self._loaded_notify_func is None:
+                self._loaded_notify_func = self._load_notify_func()
+            return self._loaded_notify_func(*args, **kwargs)
+        except Exception as exc:
+            LOGGER.warning("Failed to send Home Assistant update notification: %s", exc)
+            return {"status": "failed", "error": str(exc)}
 
 
 def parse_ha_datetime(value: str) -> datetime:
