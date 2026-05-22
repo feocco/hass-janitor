@@ -166,17 +166,19 @@ class MonitorFakeClient(FakeClient):
         self,
         *,
         backup_state: str,
+        backup_attributes: dict[str, Any] | None = None,
         initial_states: list[dict[str, Any]],
     ) -> None:
         super().__init__(initial_states=initial_states)
         self.backup_state = backup_state
+        self.backup_attributes = backup_attributes or {"event_type": "completed"}
 
     def get_state(self, entity_id: str) -> dict[str, Any]:
-        if entity_id == "event.backup_automatic_backup":
+        if entity_id in {"event.backup_automatic_backup", "sensor.backup_state"}:
             return {
                 "entity_id": entity_id,
                 "state": self.backup_state,
-                "attributes": {"event_type": "completed"},
+                "attributes": self.backup_attributes,
             }
         return super().get_state(entity_id)
 
@@ -1154,6 +1156,36 @@ class MonitorTests(TestCase):
         self.assertEqual(summary.discovered_count, 1)
         self.assertEqual(notifications[0]["title"], "Home Assistant updates available")
         self.assertEqual(notifications[0]["buttons"][0]["title"], "Update now")
+
+    def test_backup_status_uses_configured_timestamp_attribute(self) -> None:
+        client = MonitorFakeClient(
+            backup_state="backed_up",
+            backup_attributes={
+                "last_backup": datetime.now(timezone.utc).isoformat(),
+            },
+            initial_states=[],
+        )
+        config = MonitorConfig(
+            ha_base_url="https://example.ui.nabu.casa",
+            ha_token="ha-token",
+            audit_path=Path(os.devnull),
+            backup_entity_id="sensor.backup_state",
+            backup_max_age_days=7,
+            check_interval_seconds=86400,
+            notification_cooldown_seconds=21600,
+            backup_timestamp_attribute="last_backup",
+        )
+        monitor = JanitorMonitor(
+            config,
+            client_factory=lambda: client,
+            notify_func=lambda title, message, **kwargs: {"status": "sent"},
+        )
+
+        status = monitor.backup_status(client)
+
+        self.assertTrue(status.fresh)
+        self.assertEqual(status.state, client.backup_attributes["last_backup"])
+        self.assertEqual(status.reason, "Backup is fresh.")
 
     def _monitor_config(self) -> MonitorConfig:
         return MonitorConfig(

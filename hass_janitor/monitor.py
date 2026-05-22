@@ -31,6 +31,7 @@ class MonitorConfig:
     backup_max_age_days: int
     check_interval_seconds: int
     notification_cooldown_seconds: int
+    backup_timestamp_attribute: str = ""
 
 
 @dataclass(frozen=True)
@@ -117,7 +118,7 @@ class JanitorMonitor:
                 reason=f"Could not read backup entity: {exc}",
             )
 
-        raw_state = str(state.get("state") or "").strip()
+        raw_state = self._backup_timestamp(state)
         try:
             backup_time = parse_ha_datetime(raw_state)
         except ValueError:
@@ -149,6 +150,13 @@ class JanitorMonitor:
             age_days=age_days,
             reason=f"Latest backup is {age_days:.1f} days old.",
         )
+
+    def _backup_timestamp(self, state: dict[str, Any]) -> str:
+        attribute_name = self.config.backup_timestamp_attribute.strip()
+        if not attribute_name:
+            return str(state.get("state") or "").strip()
+        attributes = state.get("attributes") or {}
+        return str(attributes.get(attribute_name) or "").strip()
 
     async def listen_forever(self) -> None:
         import aiohttp

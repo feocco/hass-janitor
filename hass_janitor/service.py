@@ -38,7 +38,11 @@ class Config:
         self.monitor_enabled = env_bool("HASS_JANITOR_MONITOR_ENABLED", default=True)
         self.backup_entity_id = os.environ.get(
             "HASS_JANITOR_BACKUP_ENTITY_ID",
-            "event.backup_automatic_backup",
+            "sensor.backup_state",
+        )
+        self.backup_timestamp_attribute = os.environ.get(
+            "HASS_JANITOR_BACKUP_TIMESTAMP_ATTRIBUTE",
+            "last_backup",
         )
         self.backup_max_age_days = int(os.environ.get("HASS_JANITOR_BACKUP_MAX_AGE_DAYS", "7"))
         self.check_interval_seconds = int(
@@ -217,6 +221,7 @@ def main() -> None:
                 backup_max_age_days=config.backup_max_age_days,
                 check_interval_seconds=config.check_interval_seconds,
                 notification_cooldown_seconds=config.notification_cooldown_seconds,
+                backup_timestamp_attribute=config.backup_timestamp_attribute,
             )
         )
         monitor.start()

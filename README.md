@@ -31,6 +31,8 @@ Small Home Assistant update runner with audit logging.
    - `HA_TOKEN`
    - `HASS_JANITOR_API_TOKEN` when running the HTTP service
    - `HOMELAB_FUNCTIONS_URL` and `HOMELAB_FUNCTIONS_TOKEN` for phone notifications
+   - `HASS_JANITOR_BACKUP_ENTITY_ID` and, when the timestamp lives in an
+     attribute, `HASS_JANITOR_BACKUP_TIMESTAMP_ATTRIBUTE`
 
 The CLI loads `.env` from the repo root automatically.
 
