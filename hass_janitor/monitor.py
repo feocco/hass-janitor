@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import logging
 import threading
@@ -19,7 +20,11 @@ from .runner import UpdateRunner
 
 LOGGER = logging.getLogger("hass-janitor.monitor")
 CONFIRM_ACTION = "HASS_JANITOR_CONFIRM_UPDATE"
-OPEN_UPDATES_ACTION = "URI"
+SNOOZE_ACTION = "HASS_JANITOR_SNOOZE_UPDATE"
+DISMISS_ACTION = "HASS_JANITOR_DISMISS_UPDATE"
+UPDATE_CONFIRM_TAG = "hass-janitor-update-confirm"
+UPDATE_GROUP = "hass-janitor"
+SNOOZE_DURATION = timedelta(hours=24)
 
 
 @dataclass(frozen=True)
@@ -51,6 +56,8 @@ class JanitorMonitor:
         *,
         client_factory: Callable[[], HomeAssistantClient] | None = None,
         notify_func: Callable[..., dict[str, Any]] | None = None,
+        record_action_func: Callable[..., dict[str, Any]] | None = None,
+        list_notifications_func: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self.config = config
         self.client_factory = client_factory or (
@@ -61,6 +68,10 @@ class JanitorMonitor:
         )
         self.notify_func = notify_func or self._notify_via_homelab
         self._loaded_notify_func: Callable[..., dict[str, Any]] | None = None
+        self.record_action_func = record_action_func or self._record_action_via_homelab
+        self._loaded_record_action_func: Callable[..., dict[str, Any]] | None = None
+        self.list_notifications_func = list_notifications_func or self._list_notifications_via_homelab
+        self._loaded_list_notifications_func: Callable[..., dict[str, Any]] | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_signature = ""
@@ -254,7 +265,12 @@ class JanitorMonitor:
     def handle_notification_action(self, data: dict[str, Any]) -> None:
         action = data.get("action")
         LOGGER.info("Mobile notification action: %s", json.dumps(data, sort_keys=True, default=str))
-        if action != CONFIRM_ACTION or not self._pending_confirmation:
+        self._record_notification_action(data)
+        action_name, _token = split_action_token(str(action or ""))
+        if action_name in {SNOOZE_ACTION, DISMISS_ACTION}:
+            self._pending_confirmation = False
+            return
+        if action_name != CONFIRM_ACTION or not self._pending_confirmation:
             return
 
         client = self.client_factory()
@@ -315,6 +331,10 @@ class JanitorMonitor:
         signature = "confirm:" + "|".join(update_lines) + extra
         if not self._should_notify(signature):
             return
+        token = confirmation_action_token(signature)
+        if self._is_confirmation_suppressed(token):
+            LOGGER.info("Skipping update confirmation because action token %s is suppressed", token)
+            return
 
         self._pending_confirmation = True
         backup_age = (
@@ -330,12 +350,13 @@ class JanitorMonitor:
                 + extra
                 + f". Backup is {backup_age}."
             ),
-            tag="hass-janitor-update-confirm",
-            group="hass-janitor",
+            tag=UPDATE_CONFIRM_TAG,
+            group=UPDATE_GROUP,
             url="/config/updates",
             buttons=[
-                {"title": "Update now", "action": CONFIRM_ACTION},
-                {"title": "Open updates", "action": OPEN_UPDATES_ACTION, "uri": "/config/updates"},
+                {"title": "Update now", "action": f"{CONFIRM_ACTION}::{token}"},
+                {"title": "Snooze 24h", "action": f"{SNOOZE_ACTION}::{token}"},
+                {"title": "Dismiss this version", "action": f"{DISMISS_ACTION}::{token}"},
             ],
         )
         LOGGER.info("Update confirmation notification sent for reason=%s", reason)
@@ -371,6 +392,18 @@ class JanitorMonitor:
 
         return notify_joe
 
+    @staticmethod
+    def _load_record_action_func():
+        from homelab import record_notification_action
+
+        return record_notification_action
+
+    @staticmethod
+    def _load_list_notifications_func():
+        from homelab import list_notifications
+
+        return list_notifications
+
     def _notify_via_homelab(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         try:
             if self._loaded_notify_func is None:
@@ -380,6 +413,70 @@ class JanitorMonitor:
             LOGGER.warning("Failed to send Home Assistant update notification: %s", exc)
             return {"status": "failed", "error": str(exc)}
 
+    def _record_notification_action(self, data: dict[str, Any]) -> None:
+        action = str(data.get("action") or "").strip()
+        if not action.startswith("HASS_JANITOR_"):
+            return
+
+        reply_text = data.get("reply_text")
+        self.record_action_func(
+            action,
+            tag=str(data.get("tag") or UPDATE_CONFIRM_TAG).strip(),
+            group=str(data.get("group") or UPDATE_GROUP).strip(),
+            reply_text=reply_text if isinstance(reply_text, str) and reply_text.strip() else None,
+            event=data,
+        )
+
+    def _record_action_via_homelab(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        try:
+            if self._loaded_record_action_func is None:
+                self._loaded_record_action_func = self._load_record_action_func()
+            return self._loaded_record_action_func(*args, **kwargs)
+        except Exception as exc:
+            LOGGER.warning("Failed to record notification action: %s", exc)
+            return {"status": "failed", "error": str(exc)}
+
+    def _list_notifications_via_homelab(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        try:
+            if self._loaded_list_notifications_func is None:
+                self._loaded_list_notifications_func = self._load_list_notifications_func()
+            return self._loaded_list_notifications_func(*args, **kwargs)
+        except Exception as exc:
+            LOGGER.warning("Failed to read notification ledger: %s", exc)
+            return {"notifications": []}
+
+    def _is_confirmation_suppressed(self, token: str) -> bool:
+        history = self.list_notifications_func(
+            group=UPDATE_GROUP,
+            tag=UPDATE_CONFIRM_TAG,
+            limit=100,
+        )
+        notifications = history.get("notifications")
+        if not isinstance(notifications, list):
+            return False
+
+        now = datetime.now(timezone.utc)
+        for notification in notifications:
+            actions = notification.get("actions") if isinstance(notification, dict) else None
+            if not isinstance(actions, list):
+                continue
+            for action_event in actions:
+                if not isinstance(action_event, dict):
+                    continue
+                action_name, action_token = split_action_token(str(action_event.get("action") or ""))
+                if action_token != token:
+                    continue
+                if action_name == DISMISS_ACTION:
+                    return True
+                if action_name == SNOOZE_ACTION:
+                    try:
+                        created_at = parse_ha_datetime(str(action_event.get("created_at") or ""))
+                    except ValueError:
+                        continue
+                    if now - created_at < SNOOZE_DURATION:
+                        return True
+        return False
+
 
 def parse_ha_datetime(value: str) -> datetime:
     if value in {"", "unknown", "unavailable", "none"}:
@@ -388,6 +485,17 @@ def parse_ha_datetime(value: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def confirmation_action_token(signature: str) -> str:
+    return hashlib.sha256(signature.encode("utf-8")).hexdigest()[:16]
+
+
+def split_action_token(action: str) -> tuple[str, str]:
+    if "::" not in action:
+        return action, ""
+    name, token = action.split("::", 1)
+    return name, token
 
 
 def websocket_url(ha_url: str) -> str:

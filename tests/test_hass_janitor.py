@@ -17,8 +17,11 @@ from hass_janitor import cli
 from hass_janitor.audit import render_audit_entry
 from hass_janitor.client import HAAuthError, HAConnectionError, HAResponseError
 from hass_janitor.monitor import (
+    DISMISS_ACTION,
     JanitorMonitor,
     MonitorConfig,
+    SNOOZE_ACTION,
+    confirmation_action_token,
     parse_ha_datetime,
     summarize_update_event,
     update_event_signature,
@@ -1099,6 +1102,50 @@ class MonitorTests(TestCase):
 
         self.assertEqual(calls, ["state_changed:update.example"])
 
+    def test_notification_action_is_recorded_even_without_pending_confirmation(self) -> None:
+        recorded: list[dict[str, Any]] = []
+        monitor = JanitorMonitor(
+            self._monitor_config(),
+            client_factory=lambda: MonitorFakeClient(
+                backup_state=datetime.now(timezone.utc).isoformat(),
+                initial_states=[],
+            ),
+            notify_func=lambda title, message, **kwargs: {"status": "sent"},
+            record_action_func=lambda action, **kwargs: recorded.append(
+                {"action": action, **kwargs}
+            )
+            or {"status": "recorded"},
+        )
+
+        monitor.handle_notification_action(
+            {
+                "action": "HASS_JANITOR_CONFIRM_UPDATE",
+                "tag": "hass-janitor-update-confirm",
+                "group": "hass-janitor",
+                "reply_text": "run it",
+                "sourceDeviceName": "Pixel",
+            }
+        )
+
+        self.assertEqual(
+            recorded,
+            [
+                {
+                    "action": "HASS_JANITOR_CONFIRM_UPDATE",
+                    "tag": "hass-janitor-update-confirm",
+                    "group": "hass-janitor",
+                    "reply_text": "run it",
+                    "event": {
+                        "action": "HASS_JANITOR_CONFIRM_UPDATE",
+                        "tag": "hass-janitor-update-confirm",
+                        "group": "hass-janitor",
+                        "reply_text": "run it",
+                        "sourceDeviceName": "Pixel",
+                    },
+                }
+            ],
+        )
+
     def test_check_once_blocks_when_backup_is_stale(self) -> None:
         notifications: list[dict[str, Any]] = []
         client = MonitorFakeClient(
@@ -1120,6 +1167,7 @@ class MonitorTests(TestCase):
                 {"title": title, "message": message, **kwargs}
             )
             or {"status": "sent"},
+            list_notifications_func=lambda **kwargs: {"notifications": []},
         )
 
         summary = monitor.check_once(reason="test")
@@ -1149,6 +1197,7 @@ class MonitorTests(TestCase):
                 {"title": title, "message": message, **kwargs}
             )
             or {"status": "sent"},
+            list_notifications_func=lambda **kwargs: {"notifications": []},
         )
 
         summary = monitor.check_once(reason="test")
@@ -1156,6 +1205,91 @@ class MonitorTests(TestCase):
         self.assertEqual(summary.discovered_count, 1)
         self.assertEqual(notifications[0]["title"], "Home Assistant updates available")
         self.assertEqual(notifications[0]["buttons"][0]["title"], "Update now")
+        self.assertEqual(notifications[0]["buttons"][1]["title"], "Snooze 24h")
+        self.assertEqual(notifications[0]["buttons"][2]["title"], "Dismiss this version")
+        self.assertTrue(notifications[0]["buttons"][0]["action"].startswith("HASS_JANITOR_CONFIRM_UPDATE::"))
+
+    def test_check_once_skips_confirmation_when_fingerprint_is_snoozed(self) -> None:
+        notifications: list[dict[str, Any]] = []
+        update_state = build_state(
+            "update.home_assistant_core_update",
+            "on",
+            title="Home Assistant Core",
+            installed_version="2026.2.1",
+            latest_version="2026.4.4",
+        )
+        update_line = "Home Assistant Core: 2026.2.1 -> 2026.4.4"
+        token = confirmation_action_token(f"confirm:{update_line}")
+        client = MonitorFakeClient(
+            backup_state=datetime.now(timezone.utc).isoformat(),
+            initial_states=[update_state],
+        )
+        monitor = JanitorMonitor(
+            self._monitor_config(),
+            client_factory=lambda: client,
+            notify_func=lambda title, message, **kwargs: notifications.append(
+                {"title": title, "message": message, **kwargs}
+            )
+            or {"status": "sent"},
+            list_notifications_func=lambda **kwargs: {
+                "notifications": [
+                    {
+                        "actions": [
+                            {
+                                "action": f"{SNOOZE_ACTION}::{token}",
+                                "created_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                        ]
+                    }
+                ]
+            },
+        )
+
+        summary = monitor.check_once(reason="test")
+
+        self.assertEqual(summary.discovered_count, 1)
+        self.assertEqual(notifications, [])
+
+    def test_check_once_skips_confirmation_when_fingerprint_is_dismissed(self) -> None:
+        notifications: list[dict[str, Any]] = []
+        update_state = build_state(
+            "update.home_assistant_core_update",
+            "on",
+            title="Home Assistant Core",
+            installed_version="2026.2.1",
+            latest_version="2026.4.4",
+        )
+        update_line = "Home Assistant Core: 2026.2.1 -> 2026.4.4"
+        token = confirmation_action_token(f"confirm:{update_line}")
+        client = MonitorFakeClient(
+            backup_state=datetime.now(timezone.utc).isoformat(),
+            initial_states=[update_state],
+        )
+        monitor = JanitorMonitor(
+            self._monitor_config(),
+            client_factory=lambda: client,
+            notify_func=lambda title, message, **kwargs: notifications.append(
+                {"title": title, "message": message, **kwargs}
+            )
+            or {"status": "sent"},
+            list_notifications_func=lambda **kwargs: {
+                "notifications": [
+                    {
+                        "actions": [
+                            {
+                                "action": f"{DISMISS_ACTION}::{token}",
+                                "created_at": "2026-01-01T00:00:00+00:00",
+                            }
+                        ]
+                    }
+                ]
+            },
+        )
+
+        summary = monitor.check_once(reason="test")
+
+        self.assertEqual(summary.discovered_count, 1)
+        self.assertEqual(notifications, [])
 
     def test_backup_status_uses_configured_timestamp_attribute(self) -> None:
         client = MonitorFakeClient(

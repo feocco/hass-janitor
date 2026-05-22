@@ -59,7 +59,10 @@ curl -X POST http://localhost:8092/v1/home-assistant/update `
 The deployed service also runs a monitor by default. It subscribes to Home
 Assistant `state_changed` events, logs summarized `update.*` payloads, checks
 backup freshness, and sends Joe a confirmation notification before running
-updates.
+updates. Notification action responses are recorded in the shared
+`homelab-functions` notification ledger. The update prompt supports updating
+now, snoozing the same update fingerprint for 24 hours, or dismissing the same
+version set until the available updates change.
 
 ## Notes
 
