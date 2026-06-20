@@ -17,6 +17,7 @@ from hass_janitor import cli
 from hass_janitor.audit import render_audit_entry
 from hass_janitor.client import HAAuthError, HAConnectionError, HAResponseError
 from hass_janitor.monitor import (
+    CONFIRM_ACTION,
     DISMISS_ACTION,
     JanitorMonitor,
     MonitorConfig,
@@ -26,7 +27,7 @@ from hass_janitor.monitor import (
     summarize_update_event,
     update_event_signature,
 )
-from hass_janitor.models import RestartResult, RunSummary
+from hass_janitor.models import RestartResult, RunSummary, UpdateAttempt
 from hass_janitor.runner import UpdateRunner, discover_updates, order_updates
 from hass_janitor.service import Handler, parse_mode
 
@@ -1145,6 +1146,291 @@ class MonitorTests(TestCase):
                 }
             ],
         )
+
+    def test_process_ledger_action_runs_matching_update_confirmation(self) -> None:
+        update_state = build_state(
+            "update.home_assistant_core_update",
+            "on",
+            title="Home Assistant Core",
+            installed_version="2026.5.4",
+            latest_version="2026.6.4",
+        )
+        token = confirmation_action_token("confirm:Home Assistant Core: 2026.5.4 -> 2026.6.4")
+        client = MonitorFakeClient(
+            backup_state=datetime.now(timezone.utc).isoformat(),
+            initial_states=[update_state],
+        )
+        notifications: list[dict[str, Any]] = []
+        preflight_summary = RunSummary(
+            started_at=datetime.now(timezone.utc),
+            finished_at=datetime.now(timezone.utc),
+            base_url="https://example.ui.nabu.casa",
+            mode="preflight",
+            discovered_count=1,
+            updates=[
+                UpdateAttempt(
+                    entity_id="update.home_assistant_core_update",
+                    name="Home Assistant Core",
+                    from_version="2026.5.4",
+                    to_version="2026.6.4",
+                    result="planned",
+                    started_at=datetime.now(timezone.utc),
+                    finished_at=datetime.now(timezone.utc),
+                    notes="Preflight only.",
+                )
+            ],
+        )
+        run_summary = RunSummary(
+            started_at=datetime.now(timezone.utc),
+            finished_at=datetime.now(timezone.utc),
+            base_url="https://example.ui.nabu.casa",
+            mode="run",
+            discovered_count=1,
+            attempted_count=1,
+            succeeded_count=1,
+            notes="Update run completed.",
+        )
+        runner_instances = []
+
+        class FakeRunner:
+            def __init__(self, *_args, **_kwargs):
+                runner_instances.append(self)
+
+            def preflight(self):
+                return preflight_summary
+
+            def run(self):
+                return run_summary
+
+        ledger = {
+            "notifications": [
+                {
+                    "id": 138,
+                    "tag": "hass-janitor-update-confirm",
+                    "group": "hass-janitor",
+                    "actions": [
+                        {
+                            "id": 99,
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "action": f"HASS_JANITOR_CONFIRM_UPDATE::{token}",
+                            "tag": "hass-janitor-update-confirm",
+                            "group": "hass-janitor",
+                            "event": {"sourceDeviceName": "Pixel"},
+                        }
+                    ],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            monitor = JanitorMonitor(
+                MonitorConfig(
+                    **{
+                        **self._monitor_config().__dict__,
+                        "action_state_path": Path(tmpdir) / "actions.json",
+                    }
+                ),
+                client_factory=lambda: client,
+                notify_func=lambda title, message, **kwargs: notifications.append(
+                    {"title": title, "message": message, **kwargs}
+                )
+                or {"status": "sent"},
+                list_notifications_func=lambda **kwargs: ledger,
+            )
+
+            with mock.patch("hass_janitor.monitor.UpdateRunner", FakeRunner):
+                monitor.process_ledger_actions()
+
+        self.assertEqual(notifications[0]["title"], "Home Assistant update finished")
+        self.assertIn(99, monitor._processed_action_ids)
+
+    def test_process_ledger_action_ignores_duplicate_after_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            action_state_path = Path(tmpdir) / "actions.json"
+            action_state_path.write_text('{"processed_action_ids":[99]}', encoding="utf-8")
+            monitor = JanitorMonitor(
+                MonitorConfig(
+                    **{
+                        **self._monitor_config().__dict__,
+                        "action_state_path": action_state_path,
+                    }
+                ),
+                client_factory=lambda: MonitorFakeClient(
+                    backup_state=datetime.now(timezone.utc).isoformat(),
+                    initial_states=[],
+                ),
+                list_notifications_func=lambda **kwargs: {
+                    "notifications": [
+                        {
+                            "actions": [
+                                {
+                                    "id": 99,
+                                    "created_at": datetime.now(timezone.utc).isoformat(),
+                                    "action": "HASS_JANITOR_CONFIRM_UPDATE::token",
+                                }
+                            ]
+                        }
+                    ]
+                },
+            )
+
+            with mock.patch("hass_janitor.monitor.UpdateRunner") as runner:
+                monitor.process_ledger_actions()
+
+        runner.assert_not_called()
+
+    def test_process_ledger_action_blocks_run_when_backup_is_stale(self) -> None:
+        update_state = build_state(
+            "update.home_assistant_core_update",
+            "on",
+            title="Home Assistant Core",
+            installed_version="2026.5.4",
+            latest_version="2026.6.4",
+        )
+        token = confirmation_action_token("confirm:Home Assistant Core: 2026.5.4 -> 2026.6.4")
+        client = MonitorFakeClient(
+            backup_state="2026-05-01T04:00:00+00:00",
+            initial_states=[update_state],
+        )
+        notifications: list[dict[str, Any]] = []
+        preflight_summary = RunSummary(
+            started_at=datetime.now(timezone.utc),
+            finished_at=datetime.now(timezone.utc),
+            base_url="https://example.ui.nabu.casa",
+            mode="preflight",
+            discovered_count=1,
+            updates=[
+                UpdateAttempt(
+                    entity_id="update.home_assistant_core_update",
+                    name="Home Assistant Core",
+                    from_version="2026.5.4",
+                    to_version="2026.6.4",
+                    result="planned",
+                    started_at=datetime.now(timezone.utc),
+                    finished_at=datetime.now(timezone.utc),
+                    notes="Preflight only.",
+                )
+            ],
+        )
+
+        class FakeRunner:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def preflight(self):
+                return preflight_summary
+
+            def run(self):
+                raise AssertionError("stale backup should block run")
+
+        ledger = {
+            "notifications": [
+                {
+                    "actions": [
+                        {
+                            "id": 100,
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "action": f"{CONFIRM_ACTION}::{token}",
+                        }
+                    ]
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            monitor = JanitorMonitor(
+                MonitorConfig(
+                    **{
+                        **self._monitor_config().__dict__,
+                        "action_state_path": Path(tmpdir) / "actions.json",
+                    }
+                ),
+                client_factory=lambda: client,
+                notify_func=lambda title, message, **kwargs: notifications.append(
+                    {"title": title, "message": message, **kwargs}
+                )
+                or {"status": "sent"},
+                list_notifications_func=lambda **kwargs: ledger,
+            )
+
+            with mock.patch("hass_janitor.monitor.UpdateRunner", FakeRunner):
+                monitor.process_ledger_actions()
+
+        self.assertEqual(notifications[0]["title"], "Home Assistant update blocked")
+        self.assertIn(100, monitor._processed_action_ids)
+
+    def test_process_ledger_snooze_and_dismiss_actions_are_persisted(self) -> None:
+        update_state = build_state(
+            "update.home_assistant_core_update",
+            "on",
+            title="Home Assistant Core",
+            installed_version="2026.5.4",
+            latest_version="2026.6.4",
+        )
+        token = confirmation_action_token("confirm:Home Assistant Core: 2026.5.4 -> 2026.6.4")
+        preflight_summary = RunSummary(
+            started_at=datetime.now(timezone.utc),
+            finished_at=datetime.now(timezone.utc),
+            base_url="https://example.ui.nabu.casa",
+            mode="preflight",
+            discovered_count=1,
+            updates=[
+                UpdateAttempt(
+                    entity_id="update.home_assistant_core_update",
+                    name="Home Assistant Core",
+                    from_version="2026.5.4",
+                    to_version="2026.6.4",
+                    result="planned",
+                    started_at=datetime.now(timezone.utc),
+                    finished_at=datetime.now(timezone.utc),
+                    notes="Preflight only.",
+                )
+            ],
+        )
+
+        class FakeRunner:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def preflight(self):
+                return preflight_summary
+
+            def run(self):
+                raise AssertionError("snooze/dismiss should not run updates")
+
+        for action_id, action_name in ((101, SNOOZE_ACTION), (102, DISMISS_ACTION)):
+            with self.subTest(action=action_name), tempfile.TemporaryDirectory() as tmpdir:
+                ledger = {
+                    "notifications": [
+                        {
+                            "actions": [
+                                {
+                                    "id": action_id,
+                                    "created_at": datetime.now(timezone.utc).isoformat(),
+                                    "action": f"{action_name}::{token}",
+                                }
+                            ]
+                        }
+                    ]
+                }
+                monitor = JanitorMonitor(
+                    MonitorConfig(
+                        **{
+                            **self._monitor_config().__dict__,
+                            "action_state_path": Path(tmpdir) / "actions.json",
+                        }
+                    ),
+                    client_factory=lambda: MonitorFakeClient(
+                        backup_state=datetime.now(timezone.utc).isoformat(),
+                        initial_states=[update_state],
+                    ),
+                    list_notifications_func=lambda **kwargs: ledger,
+                )
+                monitor._pending_confirmation = True
+
+                with mock.patch("hass_janitor.monitor.UpdateRunner", FakeRunner):
+                    monitor.process_ledger_actions()
+
+                self.assertFalse(monitor._pending_confirmation)
+                self.assertIn(action_id, monitor._processed_action_ids)
 
     def test_check_once_blocks_when_backup_is_stale(self) -> None:
         notifications: list[dict[str, Any]] = []

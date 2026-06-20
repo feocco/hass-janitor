@@ -21,6 +21,7 @@ Small Home Assistant update runner with audit logging.
   - runs a small authenticated HTTP wrapper for deployed homelab use
   - exposes `/health` and `POST /v1/home-assistant/update`
   - listens for Home Assistant update state changes and mobile notification actions
+  - polls the shared notification ledger as a durable fallback for button actions
   - blocks update prompts when the configured backup timestamp is older than 7 days
 
 ## Setup
@@ -60,9 +61,11 @@ The deployed service also runs a monitor by default. It subscribes to Home
 Assistant `state_changed` events, logs summarized `update.*` payloads, checks
 backup freshness, and sends Joe a confirmation notification before running
 updates. Notification action responses are recorded in the shared
-`homelab-functions` notification ledger. The update prompt supports updating
-now, snoozing the same update fingerprint for 24 hours, or dismissing the same
-version set until the available updates change.
+`homelab-functions` notification ledger, and the monitor polls that ledger so a
+button tap can still be handled after a missed WebSocket callback or service
+restart. The update prompt supports updating now, snoozing the same update
+fingerprint for 24 hours, or dismissing the same version set until the available
+updates change.
 
 ## Notes
 

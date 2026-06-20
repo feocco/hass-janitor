@@ -51,6 +51,15 @@ class Config:
         self.notification_cooldown_seconds = int(
             os.environ.get("HASS_JANITOR_NOTIFICATION_COOLDOWN_SECONDS", str(6 * 60 * 60))
         )
+        self.ledger_action_poll_seconds = int(
+            os.environ.get("HASS_JANITOR_LEDGER_ACTION_POLL_SECONDS", "30")
+        )
+        self.action_state_path = Path(
+            os.environ.get(
+                "HASS_JANITOR_ACTION_STATE_PATH",
+                str(self.audit_path.parent / "processed-notification-actions.json"),
+            )
+        )
 
 
 def required_env(name: str) -> str:
@@ -89,6 +98,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         config: Config = self.server.config  # type: ignore[attr-defined]
+        monitor = getattr(self.server, "monitor", None)
+        monitor_health = monitor.health_status() if monitor is not None else None
         self._send_json(
             HTTPStatus.OK,
             {
@@ -98,6 +109,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ha_token_configured": bool(config.ha_token),
                 "api_token_configured": bool(config.api_token),
                 "audit_path": str(config.audit_path),
+                "monitor": monitor_health,
             },
         )
 
@@ -222,10 +234,13 @@ def main() -> None:
                 check_interval_seconds=config.check_interval_seconds,
                 notification_cooldown_seconds=config.notification_cooldown_seconds,
                 backup_timestamp_attribute=config.backup_timestamp_attribute,
+                ledger_action_poll_seconds=config.ledger_action_poll_seconds,
+                action_state_path=config.action_state_path,
             )
         )
         monitor.start()
         LOGGER.info("hass-janitor monitor started")
+    server.monitor = monitor  # type: ignore[attr-defined]
     print(
         f"hass-janitor listening on {config.service_host}:{config.service_port}",
         flush=True,

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
+from pathlib import Path
 import threading
 from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
@@ -37,6 +38,8 @@ class MonitorConfig:
     check_interval_seconds: int
     notification_cooldown_seconds: int
     backup_timestamp_attribute: str = ""
+    ledger_action_poll_seconds: int = 30
+    action_state_path: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,19 @@ class JanitorMonitor:
         self._last_notification_at: datetime | None = None
         self._pending_confirmation = False
         self._last_event_signature_by_entity: dict[str, str] = {}
+        self._action_state_path = (
+            Path(config.action_state_path)
+            if config.action_state_path is not None
+            else Path(config.audit_path).parent / "processed-notification-actions.json"
+        )
+        self._processed_action_ids = self._load_processed_action_ids()
+        self._current_confirmation_token = ""
+        self._last_notification_sent_at: datetime | None = None
+        self._last_notification_id: int | None = None
+        self._last_ledger_action_seen_id: int | None = None
+        self._last_processed_action_id: int | None = None
+        self._ha_listener_connected = False
+        self._ha_listener_last_error = ""
 
     def start(self) -> None:
         if self._thread is not None:
@@ -176,6 +192,8 @@ class JanitorMonitor:
             try:
                 await self._listen_once(aiohttp)
             except Exception as exc:
+                self._ha_listener_connected = False
+                self._ha_listener_last_error = str(exc)
                 LOGGER.warning("HA event listener disconnected: %s", exc)
                 await asyncio.sleep(10)
 
@@ -186,6 +204,14 @@ class JanitorMonitor:
             except Exception as exc:
                 LOGGER.warning("Periodic update check failed: %s", exc)
             await asyncio.sleep(self.config.check_interval_seconds)
+
+    async def ledger_action_check_forever(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.process_ledger_actions()
+            except Exception as exc:
+                LOGGER.warning("Ledger notification action check failed: %s", exc)
+            await asyncio.sleep(self.config.ledger_action_poll_seconds)
 
     async def _listen_once(self, aiohttp_module) -> None:
         ws_url = websocket_url(self.config.ha_base_url)
@@ -220,6 +246,8 @@ class JanitorMonitor:
                     }
                 )
                 LOGGER.info("Subscribed to Home Assistant update and notification events")
+                self._ha_listener_connected = True
+                self._ha_listener_last_error = ""
 
                 async for message in ws:
                     if message.type != aiohttp_module.WSMsgType.TEXT:
@@ -265,10 +293,11 @@ class JanitorMonitor:
     def handle_notification_action(self, data: dict[str, Any]) -> None:
         action = data.get("action")
         LOGGER.info("Mobile notification action: %s", json.dumps(data, sort_keys=True, default=str))
-        self._record_notification_action(data)
+        record_result = self._record_notification_action(data)
         action_name, _token = split_action_token(str(action or ""))
         if action_name in {SNOOZE_ACTION, DISMISS_ACTION}:
             self._pending_confirmation = False
+            self._mark_recorded_action_processed(record_result)
             return
         if action_name != CONFIRM_ACTION or not self._pending_confirmation:
             return
@@ -278,11 +307,13 @@ class JanitorMonitor:
         if not backup.fresh:
             summary = UpdateRunner(client, base_url=self.config.ha_base_url).preflight()
             self._notify_stale_backup(summary, backup, reason="confirmation")
+            self._mark_recorded_action_processed(record_result)
             return
 
         summary = UpdateRunner(client, base_url=self.config.ha_base_url).run()
         append_audit_log(self.config.audit_path, summary)
         self._pending_confirmation = False
+        self._mark_recorded_action_processed(record_result)
         self.notify_func(
             "Home Assistant update finished",
             (
@@ -293,6 +324,88 @@ class JanitorMonitor:
             tag="hass-janitor-update-finished",
             group="hass-janitor",
         )
+
+    def process_ledger_actions(self) -> None:
+        history = self.list_notifications_func(
+            group=UPDATE_GROUP,
+            tag=UPDATE_CONFIRM_TAG,
+            limit=100,
+        )
+        notifications = history.get("notifications")
+        if not isinstance(notifications, list):
+            return
+
+        actions: list[dict[str, Any]] = []
+        for notification in notifications:
+            if not isinstance(notification, dict):
+                continue
+            notification_actions = notification.get("actions")
+            if not isinstance(notification_actions, list):
+                continue
+            for action_event in notification_actions:
+                if isinstance(action_event, dict):
+                    actions.append(action_event)
+
+        for action_event in sorted(actions, key=lambda item: int(item.get("id") or 0)):
+            action_id = self._action_id(action_event)
+            if action_id is None:
+                continue
+            self._last_ledger_action_seen_id = action_id
+            if action_id in self._processed_action_ids:
+                continue
+
+            action_name, action_token = split_action_token(str(action_event.get("action") or ""))
+            if not action_name.startswith("HASS_JANITOR_"):
+                continue
+            if action_name not in {CONFIRM_ACTION, SNOOZE_ACTION, DISMISS_ACTION}:
+                self._mark_action_processed(action_id)
+                continue
+
+            client = self.client_factory()
+            runner = UpdateRunner(client, base_url=self.config.ha_base_url)
+            preflight = runner.preflight()
+            if preflight.exit_code != 0 or preflight.discovered_count == 0:
+                self._mark_action_processed(action_id)
+                continue
+
+            token = confirmation_action_token(confirmation_signature(preflight))
+            self._current_confirmation_token = token
+            if action_token != token:
+                LOGGER.info(
+                    "Ignoring stale notification action id=%s token=%s current=%s",
+                    action_id,
+                    action_token,
+                    token,
+                )
+                self._mark_action_processed(action_id)
+                continue
+
+            if action_name in {SNOOZE_ACTION, DISMISS_ACTION}:
+                self._pending_confirmation = False
+                self._mark_action_processed(action_id)
+                continue
+
+            append_audit_log(self.config.audit_path, preflight)
+            backup = self.backup_status(client)
+            if not backup.fresh:
+                self._notify_stale_backup(preflight, backup, reason="ledger-confirmation")
+                self._mark_action_processed(action_id)
+                continue
+
+            summary = runner.run()
+            append_audit_log(self.config.audit_path, summary)
+            self._pending_confirmation = False
+            self._mark_action_processed(action_id)
+            self.notify_func(
+                "Home Assistant update finished",
+                (
+                    f"Processed {summary.attempted_count}/{summary.discovered_count}. "
+                    f"Succeeded: {summary.succeeded_count}, failed: {summary.failed_count}, "
+                    f"timed out: {summary.timed_out_count}, restart: {summary.restart.result}."
+                ),
+                tag="hass-janitor-update-finished",
+                group="hass-janitor",
+            )
 
     def _notify_stale_backup(
         self,
@@ -328,10 +441,11 @@ class JanitorMonitor:
             for attempt in summary.updates[:4]
         ]
         extra = "" if len(summary.updates) <= 4 else f" +{len(summary.updates) - 4} more"
-        signature = "confirm:" + "|".join(update_lines) + extra
+        signature = confirmation_signature(summary)
         if not self._should_notify(signature):
             return
         token = confirmation_action_token(signature)
+        self._current_confirmation_token = token
         if self._is_confirmation_suppressed(token):
             LOGGER.info("Skipping update confirmation because action token %s is suppressed", token)
             return
@@ -342,7 +456,7 @@ class JanitorMonitor:
             if backup.age_days is None
             else f"{backup.age_days:.1f} days old"
         )
-        self.notify_func(
+        result = self.notify_func(
             "Home Assistant updates available",
             (
                 f"{summary.discovered_count} update(s): "
@@ -359,6 +473,9 @@ class JanitorMonitor:
                 {"title": "Dismiss this version", "action": f"{DISMISS_ACTION}::{token}"},
             ],
         )
+        self._last_notification_sent_at = datetime.now(timezone.utc)
+        notification_id = result.get("notification_id")
+        self._last_notification_id = notification_id if isinstance(notification_id, int) else None
         LOGGER.info("Update confirmation notification sent for reason=%s", reason)
 
     def _should_notify(self, signature: str) -> bool:
@@ -384,6 +501,7 @@ class JanitorMonitor:
         await asyncio.gather(
             self.listen_forever(),
             self.periodic_check_forever(),
+            self.ledger_action_check_forever(),
         )
 
     @staticmethod
@@ -413,13 +531,13 @@ class JanitorMonitor:
             LOGGER.warning("Failed to send Home Assistant update notification: %s", exc)
             return {"status": "failed", "error": str(exc)}
 
-    def _record_notification_action(self, data: dict[str, Any]) -> None:
+    def _record_notification_action(self, data: dict[str, Any]) -> dict[str, Any] | None:
         action = str(data.get("action") or "").strip()
         if not action.startswith("HASS_JANITOR_"):
-            return
+            return None
 
         reply_text = data.get("reply_text")
-        self.record_action_func(
+        return self.record_action_func(
             action,
             tag=str(data.get("tag") or UPDATE_CONFIRM_TAG).strip(),
             group=str(data.get("group") or UPDATE_GROUP).strip(),
@@ -477,6 +595,68 @@ class JanitorMonitor:
                         return True
         return False
 
+    def health_status(self) -> dict[str, Any]:
+        return {
+            "pending_confirmation": self._pending_confirmation,
+            "last_notification_sent_at": (
+                self._last_notification_sent_at.isoformat(timespec="seconds")
+                if self._last_notification_sent_at is not None
+                else None
+            ),
+            "last_notification_id": self._last_notification_id,
+            "current_confirmation_token": self._current_confirmation_token,
+            "last_ledger_action_seen_id": self._last_ledger_action_seen_id,
+            "last_processed_action_id": self._last_processed_action_id,
+            "ha_listener_connected": self._ha_listener_connected,
+            "ha_listener_last_error": self._ha_listener_last_error,
+            "action_state_path": str(self._action_state_path),
+        }
+
+    def _load_processed_action_ids(self) -> set[int]:
+        try:
+            payload = json.loads(self._action_state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return set()
+        except (OSError, json.JSONDecodeError) as exc:
+            LOGGER.warning("Could not load notification action state: %s", exc)
+            return set()
+
+        action_ids = payload.get("processed_action_ids") if isinstance(payload, dict) else None
+        if not isinstance(action_ids, list):
+            return set()
+        return {int(action_id) for action_id in action_ids if isinstance(action_id, int)}
+
+    def _save_processed_action_ids(self) -> None:
+        self._action_state_path.parent.mkdir(parents=True, exist_ok=True)
+        action_ids = sorted(self._processed_action_ids)[-500:]
+        tmp_path = self._action_state_path.with_suffix(self._action_state_path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps({"processed_action_ids": action_ids}, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self._action_state_path)
+
+    def _mark_action_processed(self, action_id: int) -> None:
+        self._processed_action_ids.add(action_id)
+        self._last_processed_action_id = action_id
+        self._save_processed_action_ids()
+
+    def _mark_recorded_action_processed(self, result: dict[str, Any] | None) -> None:
+        if not isinstance(result, dict):
+            return
+        action_id = result.get("action_id")
+        if isinstance(action_id, int):
+            self._mark_action_processed(action_id)
+
+    @staticmethod
+    def _action_id(action_event: dict[str, Any]) -> int | None:
+        raw_id = action_event.get("id")
+        if isinstance(raw_id, int):
+            return raw_id
+        if isinstance(raw_id, str) and raw_id.isdigit():
+            return int(raw_id)
+        return None
+
 
 def parse_ha_datetime(value: str) -> datetime:
     if value in {"", "unknown", "unavailable", "none"}:
@@ -489,6 +669,15 @@ def parse_ha_datetime(value: str) -> datetime:
 
 def confirmation_action_token(signature: str) -> str:
     return hashlib.sha256(signature.encode("utf-8")).hexdigest()[:16]
+
+
+def confirmation_signature(summary: RunSummary) -> str:
+    update_lines = [
+        f"{attempt.name}: {attempt.from_version} -> {attempt.to_version}"
+        for attempt in summary.updates[:4]
+    ]
+    extra = "" if len(summary.updates) <= 4 else f" +{len(summary.updates) - 4} more"
+    return "confirm:" + "|".join(update_lines) + extra
 
 
 def split_action_token(action: str) -> tuple[str, str]:
