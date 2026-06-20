@@ -11,7 +11,6 @@ import logging
 from pathlib import Path
 import threading
 from typing import Any, Callable
-from urllib.parse import urlsplit, urlunsplit
 
 from .audit import append_audit_log
 from .client import HAClientError, HomeAssistantClient
@@ -186,11 +185,9 @@ class JanitorMonitor:
         return str(attributes.get(attribute_name) or "").strip()
 
     async def listen_forever(self) -> None:
-        import aiohttp
-
         while not self._stop_event.is_set():
             try:
-                await self._listen_once(aiohttp)
+                await self._listen_once()
             except Exception as exc:
                 self._ha_listener_connected = False
                 self._ha_listener_last_error = str(exc)
@@ -213,53 +210,36 @@ class JanitorMonitor:
                 LOGGER.warning("Ledger notification action check failed: %s", exc)
             await asyncio.sleep(self.config.ledger_action_poll_seconds)
 
-    async def _listen_once(self, aiohttp_module) -> None:
-        ws_url = websocket_url(self.config.ha_base_url)
-        async with aiohttp_module.ClientSession() as session:
-            async with session.ws_connect(ws_url) as ws:
-                auth_required = await ws.receive_json()
-                if auth_required.get("type") != "auth_required":
-                    raise RuntimeError("Home Assistant did not request WebSocket auth")
+    async def _listen_once(self) -> None:
+        HomeAssistantConfig, HomeAssistantWebSocketClient = self._load_home_assistant_websocket_client()
+        config = HomeAssistantConfig(
+            ha_url=self.config.ha_base_url,
+            ha_long_lived_token=self.config.ha_token,
+        )
+        async with HomeAssistantWebSocketClient(config) as ha:
+            ha.add_event_handler(self._handle_home_assistant_event)
+            await ha.subscribe_events("state_changed")
+            await ha.subscribe_events("mobile_app_notification_action")
+            LOGGER.info("Subscribed to Home Assistant update and notification events")
+            self._ha_listener_connected = True
+            self._ha_listener_last_error = ""
+            await ha.wait_closed()
 
-                await ws.send_json(
-                    {
-                        "type": "auth",
-                        "access_token": self.config.ha_token,
-                    }
-                )
-                auth_response = await ws.receive_json()
-                if auth_response.get("type") != "auth_ok":
-                    raise RuntimeError(f"Home Assistant auth failed: {auth_response}")
+    @staticmethod
+    def _load_home_assistant_websocket_client():
+        from homelab import HomeAssistantConfig, HomeAssistantWebSocketClient
 
-                await ws.send_json(
-                    {
-                        "id": 1,
-                        "type": "subscribe_events",
-                        "event_type": "state_changed",
-                    }
-                )
-                await ws.send_json(
-                    {
-                        "id": 2,
-                        "type": "subscribe_events",
-                        "event_type": "mobile_app_notification_action",
-                    }
-                )
-                LOGGER.info("Subscribed to Home Assistant update and notification events")
-                self._ha_listener_connected = True
-                self._ha_listener_last_error = ""
+        return HomeAssistantConfig, HomeAssistantWebSocketClient
 
-                async for message in ws:
-                    if message.type != aiohttp_module.WSMsgType.TEXT:
-                        continue
-                    payload = message.json()
-                    event = payload.get("event") or {}
-                    event_type = event.get("event_type")
-                    data = event.get("data") or {}
-                    if event_type == "state_changed":
-                        self.handle_state_changed(data)
-                    elif event_type == "mobile_app_notification_action":
-                        self.handle_notification_action(data)
+    async def _handle_home_assistant_event(self, event: dict[str, Any]) -> None:
+        event_type = event.get("event_type")
+        data = event.get("data") or {}
+        if not isinstance(data, dict):
+            return
+        if event_type == "state_changed":
+            self.handle_state_changed(data)
+        elif event_type == "mobile_app_notification_action":
+            self.handle_notification_action(data)
 
     def handle_state_changed(self, data: dict[str, Any]) -> None:
         entity_id = str(data.get("entity_id") or "")
@@ -685,23 +665,6 @@ def split_action_token(action: str) -> tuple[str, str]:
         return action, ""
     name, token = action.split("::", 1)
     return name, token
-
-
-def websocket_url(ha_url: str) -> str:
-    parsed = urlsplit(ha_url.rstrip("/"))
-    if parsed.scheme == "https":
-        scheme = "wss"
-    elif parsed.scheme == "http":
-        scheme = "ws"
-    elif parsed.scheme in ("ws", "wss"):
-        scheme = parsed.scheme
-    else:
-        raise ValueError("HA URL must start with http://, https://, ws://, or wss://")
-
-    path = parsed.path.rstrip("/")
-    if not path.endswith("/api/websocket"):
-        path = f"{path}/api/websocket"
-    return urlunsplit((scheme, parsed.netloc, path, "", ""))
 
 
 def summarize_update_event(entity_id: str, new_state: dict[str, Any]) -> dict[str, Any]:

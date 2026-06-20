@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 import threading
 from typing import Any
-from unittest import TestCase, mock
+from unittest import IsolatedAsyncioTestCase, TestCase, mock
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -1606,6 +1606,93 @@ class MonitorTests(TestCase):
         self.assertTrue(status.fresh)
         self.assertEqual(status.state, client.backup_attributes["last_backup"])
         self.assertEqual(status.reason, "Backup is fresh.")
+
+    def _monitor_config(self) -> MonitorConfig:
+        return MonitorConfig(
+            ha_base_url="https://example.ui.nabu.casa",
+            ha_token="ha-token",
+            audit_path=Path(os.devnull),
+            backup_entity_id="event.backup_automatic_backup",
+            backup_max_age_days=7,
+            check_interval_seconds=86400,
+            notification_cooldown_seconds=21600,
+        )
+
+
+class ListenerRefactorTests(IsolatedAsyncioTestCase):
+    async def test_listen_once_uses_shared_home_assistant_client(self) -> None:
+        class ExpectedDisconnect(RuntimeError):
+            pass
+
+        clients = []
+        state_events: list[dict[str, Any]] = []
+        action_events: list[dict[str, Any]] = []
+
+        class FakeHomeAssistantWebSocketClient:
+            def __init__(self, config):
+                self.config = config
+                self.handlers = []
+                self.subscriptions: list[str] = []
+                clients.append(self)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def add_event_handler(self, handler):
+                self.handlers.append(handler)
+
+            async def subscribe_events(self, event_type):
+                self.subscriptions.append(event_type)
+
+            async def wait_closed(self):
+                await self.handlers[0](
+                    {
+                        "event_type": "state_changed",
+                        "data": {"entity_id": "update.example", "new_state": {"state": "off"}},
+                    }
+                )
+                await self.handlers[0](
+                    {
+                        "event_type": "mobile_app_notification_action",
+                        "data": {"action": "HASS_JANITOR_CANARY::token"},
+                    }
+                )
+                raise ExpectedDisconnect("closed")
+
+        class FakeHomeAssistantConfig:
+            def __init__(self, *, ha_url, ha_long_lived_token):
+                self.ha_url = ha_url
+                self.ha_long_lived_token = ha_long_lived_token
+
+        monitor = JanitorMonitor(self._monitor_config())
+        monitor.handle_state_changed = state_events.append  # type: ignore[method-assign]
+        monitor.handle_notification_action = action_events.append  # type: ignore[method-assign]
+
+        with mock.patch.object(
+            monitor,
+            "_load_home_assistant_websocket_client",
+            return_value=(FakeHomeAssistantConfig, FakeHomeAssistantWebSocketClient),
+        ):
+            with self.assertRaises(ExpectedDisconnect):
+                await monitor._listen_once()
+
+        self.assertEqual(len(clients), 1)
+        self.assertEqual(clients[0].config.ha_url, "https://example.ui.nabu.casa")
+        self.assertEqual(clients[0].config.ha_long_lived_token, "ha-token")
+        self.assertEqual(
+            clients[0].subscriptions,
+            ["state_changed", "mobile_app_notification_action"],
+        )
+        self.assertTrue(monitor._ha_listener_connected)
+        self.assertEqual(monitor._ha_listener_last_error, "")
+        self.assertEqual(
+            state_events,
+            [{"entity_id": "update.example", "new_state": {"state": "off"}}],
+        )
+        self.assertEqual(action_events, [{"action": "HASS_JANITOR_CANARY::token"}])
 
     def _monitor_config(self) -> MonitorConfig:
         return MonitorConfig(
