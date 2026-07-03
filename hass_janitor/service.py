@@ -21,6 +21,8 @@ from .runner import UpdateRunner
 
 DEFAULT_AUDIT_PATH = Path("/app/logs/ha-update-audit.md")
 LOGGER = logging.getLogger("hass-janitor")
+SERVICE_NAME = "hass-janitor"
+OPENAPI_VERSION = "3.1.0"
 
 
 class ConfigError(RuntimeError):
@@ -93,25 +95,34 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "hass-janitor/1.0"
 
     def do_GET(self) -> None:
-        if self.path != "/health":
-            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+        if self.path == "/health":
+            config: Config = self.server.config  # type: ignore[attr-defined]
+            monitor = getattr(self.server, "monitor", None)
+            monitor_health = monitor.health_status() if monitor is not None else None
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "ok",
+                    "service": SERVICE_NAME,
+                    "ha_base_url_configured": bool(config.ha_base_url),
+                    "ha_token_configured": bool(config.ha_token),
+                    "api_token_configured": bool(config.api_token),
+                    "audit_path": str(config.audit_path),
+                    "monitor": monitor_health,
+                },
+            )
             return
 
-        config: Config = self.server.config  # type: ignore[attr-defined]
-        monitor = getattr(self.server, "monitor", None)
-        monitor_health = monitor.health_status() if monitor is not None else None
-        self._send_json(
-            HTTPStatus.OK,
-            {
-                "status": "ok",
-                "service": "hass-janitor",
-                "ha_base_url_configured": bool(config.ha_base_url),
-                "ha_token_configured": bool(config.ha_token),
-                "api_token_configured": bool(config.api_token),
-                "audit_path": str(config.audit_path),
-                "monitor": monitor_health,
-            },
-        )
+        if self.path == "/docs":
+            self._send_html(HTTPStatus.OK, self._render_docs_html())
+            return
+
+        if self.path == "/openapi.json":
+            config: Config = self.server.config  # type: ignore[attr-defined]
+            self._send_json(HTTPStatus.OK, self._openapi_spec(config))
+            return
+
+        self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
     def do_POST(self) -> None:
         if self.path != "/v1/home-assistant/update":
@@ -175,8 +186,275 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_html(self, status: HTTPStatus, body_text: str) -> None:
+        body = body_text.encode("utf-8")
+        self.send_response(status.value)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_error(self, status: HTTPStatus, code: str, message: str) -> None:
         self._send_json(status, {"error": {"code": code, "message": message}})
+
+    def _render_docs_html(self) -> str:
+        return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{SERVICE_NAME} API docs</title>
+    <style>
+      :root {{
+        color-scheme: light;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }}
+      body {{
+        margin: 0;
+        padding: 24px;
+        line-height: 1.5;
+        color: #111827;
+        background: #f9fafb;
+      }}
+      main {{
+        max-width: 920px;
+        margin: 0 auto;
+      }}
+      h1, h2 {{
+        line-height: 1.2;
+      }}
+      section {{
+        margin-top: 24px;
+        padding: 16px;
+        border: 1px solid #d1d5db;
+        border-radius: 8px;
+        background: #ffffff;
+      }}
+      code, pre {{
+        font-family: ui-monospace, SFMono-Regular, SF Mono, Consolas, monospace;
+        font-size: 0.95em;
+      }}
+      pre {{
+        margin: 0;
+        padding: 12px;
+        background: #f3f4f6;
+        border-radius: 6px;
+        overflow-x: auto;
+      }}
+      a {{
+        color: #1d4ed8;
+      }}
+      ul {{
+        padding-left: 20px;
+      }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>{SERVICE_NAME} API docs</h1>
+      <p>Self-contained API documentation for the Home Assistant janitor service.</p>
+      <section>
+        <h2>Reference</h2>
+        <ul>
+          <li><a href="/openapi.json">OpenAPI JSON</a></li>
+          <li><code>GET /health</code> for service health</li>
+          <li><code>POST /v1/home-assistant/update</code> for update runs</li>
+        </ul>
+      </section>
+      <section>
+        <h2>Auth</h2>
+        <p>The update endpoint requires a bearer token in the <code>Authorization</code> header.</p>
+        <pre>Authorization: Bearer &lt;token&gt;</pre>
+        <p>Browser docs do not store or execute tokens.</p>
+      </section>
+      <section>
+        <h2>Example</h2>
+        <pre>curl -X POST http://localhost:8092/v1/home-assistant/update \\
+  -H "Authorization: Bearer $HASS_JANITOR_API_TOKEN" \\
+  -H "Content-Type: application/json" \\
+  -d '{{"mode":"preflight"}}'</pre>
+      </section>
+    </main>
+  </body>
+</html>
+"""
+
+    def _openapi_spec(self, config: Config) -> dict[str, Any]:
+        return {
+            "openapi": OPENAPI_VERSION,
+            "info": {
+                "title": SERVICE_NAME,
+                "version": "1.0.0",
+                "description": (
+                    "HTTP wrapper for Home Assistant update workflows with audit logging."
+                ),
+            },
+            "paths": {
+                "/health": {
+                    "get": {
+                        "summary": "Health check",
+                        "responses": {
+                            "200": {
+                                "description": "Service health response",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "$ref": "#/components/schemas/HealthResponse"
+                                        }
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
+                "/docs": {
+                    "get": {
+                        "summary": "HTML documentation",
+                        "responses": {
+                            "200": {
+                                "description": "Self-contained HTML docs",
+                                "content": {
+                                    "text/html": {
+                                        "schema": {
+                                            "type": "string"
+                                        }
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
+                "/openapi.json": {
+                    "get": {
+                        "summary": "OpenAPI document",
+                        "responses": {
+                            "200": {
+                                "description": "OpenAPI specification",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {"type": "object"}
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
+                "/v1/home-assistant/update": {
+                    "post": {
+                        "summary": "Run Home Assistant updates",
+                        "security": [{"bearerAuth": []}],
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": "#/components/schemas/UpdateRequest"
+                                    }
+                                }
+                            },
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "Update run result",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "$ref": "#/components/schemas/UpdateResponse"
+                                        }
+                                    }
+                                },
+                            },
+                            "400": {
+                                "description": "Invalid request",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "$ref": "#/components/schemas/ErrorResponse"
+                                        }
+                                    }
+                                },
+                            },
+                            "401": {
+                                "description": "Unauthorized",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "$ref": "#/components/schemas/ErrorResponse"
+                                        }
+                                    }
+                                },
+                            },
+                        },
+                    }
+                },
+            },
+            "components": {
+                "securitySchemes": {
+                    "bearerAuth": {
+                        "type": "http",
+                        "scheme": "bearer",
+                    }
+                },
+                "schemas": {
+                    "HealthResponse": {
+                        "type": "object",
+                        "required": [
+                            "status",
+                            "service",
+                            "ha_base_url_configured",
+                            "ha_token_configured",
+                            "api_token_configured",
+                            "audit_path",
+                            "monitor",
+                        ],
+                        "properties": {
+                            "status": {"type": "string"},
+                            "service": {"type": "string"},
+                            "ha_base_url_configured": {"type": "boolean"},
+                            "ha_token_configured": {"type": "boolean"},
+                            "api_token_configured": {"type": "boolean"},
+                            "audit_path": {"type": "string"},
+                            "monitor": {"type": ["object", "null"]},
+                        },
+                    },
+                    "UpdateRequest": {
+                        "type": "object",
+                        "properties": {
+                            "mode": {
+                                "type": "string",
+                                "enum": ["dry-run", "preflight", "run"],
+                            },
+                            "confirm": {"type": "boolean"},
+                        },
+                    },
+                    "UpdateResponse": {
+                        "type": "object",
+                        "required": ["status", "mode", "exit_code", "summary"],
+                        "properties": {
+                            "status": {"type": "string"},
+                            "mode": {"type": "string"},
+                            "exit_code": {"type": "integer"},
+                            "summary": {"type": "object"},
+                        },
+                    },
+                    "ErrorResponse": {
+                        "type": "object",
+                        "required": ["error"],
+                        "properties": {
+                            "error": {
+                                "type": "object",
+                                "required": ["code", "message"],
+                                "properties": {
+                                    "code": {"type": "string"},
+                                    "message": {"type": "string"},
+                                },
+                            }
+                        },
+                    },
+                },
+            },
+            "x-configured-audit-path": str(config.audit_path),
+        }
 
 
 def parse_mode(payload: dict[str, Any]) -> str:

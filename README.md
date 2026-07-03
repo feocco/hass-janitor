@@ -19,7 +19,7 @@ Small Home Assistant update runner with audit logging.
   - waits for the Home Assistant API to come back
 - `python -m hass_janitor.service`
   - runs a small authenticated HTTP wrapper for deployed homelab use
-  - exposes `/health` and `POST /v1/home-assistant/update`
+  - exposes `/health`, `/docs`, `/openapi.json`, and `POST /v1/home-assistant/update`
   - listens for Home Assistant update state changes and mobile notification actions
   - polls the shared notification ledger as a durable fallback for button actions
   - blocks update prompts when the configured backup timestamp is older than 7 days
@@ -51,6 +51,8 @@ HTTP service examples:
 
 ```powershell
 curl http://localhost:8092/health
+curl http://localhost:8092/docs
+curl http://localhost:8092/openapi.json
 curl -X POST http://localhost:8092/v1/home-assistant/update `
   -H "Authorization: Bearer $env:HASS_JANITOR_API_TOKEN" `
   -H "Content-Type: application/json" `

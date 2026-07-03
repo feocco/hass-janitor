@@ -894,6 +894,76 @@ class CliSmokeTests(TestCase):
 
 
 class ServiceTests(TestCase):
+    def test_service_health_is_unchanged(self) -> None:
+        server, thread = self._start_server()
+        try:
+            request = Request(f"http://127.0.0.1:{server.server_port}/health", method="GET")
+            with urlopen(request, timeout=2) as response:
+                payload = json.loads(response.read())
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["service"], "hass-janitor")
+            self.assertTrue(payload["ha_base_url_configured"])
+            self.assertTrue(payload["ha_token_configured"])
+            self.assertTrue(payload["api_token_configured"])
+            self.assertEqual(payload["audit_path"], "logs/ha-update-audit.md")
+            self.assertIsNone(payload["monitor"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_service_docs_returns_html_without_token_execution(self) -> None:
+        server, thread = self._start_server()
+        try:
+            request = Request(f"http://127.0.0.1:{server.server_port}/docs", method="GET")
+            with urlopen(request, timeout=2) as response:
+                body = response.read().decode("utf-8")
+                content_type = response.headers.get_content_type()
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(content_type, "text/html")
+            self.assertIn("hass-janitor API docs", body)
+            self.assertIn("/openapi.json", body)
+            self.assertIn("/v1/home-assistant/update", body)
+            self.assertNotIn("Bearer secret", body)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_service_openapi_is_valid_json_with_documented_routes(self) -> None:
+        server, thread = self._start_server()
+        try:
+            request = Request(
+                f"http://127.0.0.1:{server.server_port}/openapi.json",
+                method="GET",
+            )
+            with urlopen(request, timeout=2) as response:
+                payload = json.loads(response.read())
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["openapi"], "3.1.0")
+            self.assertEqual(payload["info"]["title"], "hass-janitor")
+            self.assertIn("/health", payload["paths"])
+            self.assertIn("/docs", payload["paths"])
+            self.assertIn("/openapi.json", payload["paths"])
+            self.assertIn("/v1/home-assistant/update", payload["paths"])
+            self.assertEqual(
+                payload["paths"]["/v1/home-assistant/update"]["post"]["security"],
+                [{"bearerAuth": []}],
+            )
+            self.assertIn("securitySchemes", payload["components"])
+            self.assertIn(
+                "requestBody",
+                payload["paths"]["/v1/home-assistant/update"]["post"],
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_parse_mode_requires_confirm_for_run(self) -> None:
         self.assertEqual(parse_mode({}), "preflight")
         self.assertEqual(parse_mode({"mode": "dry-run"}), "dry-run")
