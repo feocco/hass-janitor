@@ -1611,7 +1611,11 @@ class MonitorTests(TestCase):
         summary = monitor.check_once(reason="test")
 
         self.assertEqual(summary.discovered_count, 1)
-        self.assertEqual(notifications[0]["title"], "Home Assistant updates available")
+        self.assertEqual(notifications[0]["title"], "Recommended Home Assistant update")
+        self.assertIn(
+            "Is the recommended update needed now, or can it wait?",
+            notifications[0]["message"],
+        )
         self.assertEqual(notifications[0]["buttons"][0]["title"], "Update now")
         self.assertEqual(notifications[0]["buttons"][1]["title"], "Snooze 24h")
         self.assertEqual(notifications[0]["buttons"][2]["title"], "Dismiss this version")
@@ -2166,7 +2170,7 @@ class UpdatePromptTests(TestCase):
         self.assertIn("+1 more optional", message)
         self.assertLess(message.index("Home Assistant Core"), message.index("Addon 1"))
 
-    def test_long_release_url_is_shortened_on_the_recommended_line(self) -> None:
+    def test_recommended_line_keeps_the_full_release_url(self) -> None:
         from hass_janitor.monitor import BackupStatus, render_update_confirmation
 
         long_url = (
@@ -2203,8 +2207,7 @@ class UpdatePromptTests(TestCase):
         )
 
         self.assertEqual(title, "Recommended Home Assistant update")
-        self.assertIn("https://github.com/v9.9.9", message)
-        self.assertNotIn("a-very-long-repository-name-for-notes", message)
+        self.assertIn(long_url, message)
         self.assertIn("Is the recommended update needed now, or can it wait?", message)
 
     def test_optional_only_prompt_does_not_ask_about_a_recommended_update(self) -> None:
@@ -2238,7 +2241,7 @@ class UpdatePromptTests(TestCase):
             ),
         )
 
-        self.assertEqual(title, "Optional Home Assistant updates")
+        self.assertEqual(title, "Optional Home Assistant update")
         self.assertIn("Mushroom v5.2.3 -> v5.3.0", message)
         self.assertNotIn("github.com", message)
         self.assertNotIn("Is the recommended update needed now", message)
@@ -2283,6 +2286,7 @@ class UpdatePromptTests(TestCase):
             500,
             HACS_MARKETPLACE_ERROR,
         )
+        client.list_states_sequence = [[state], [state]]
         notifications: list[dict[str, Any]] = []
         monitor = JanitorMonitor(
             self._monitor_config(),
@@ -2291,9 +2295,10 @@ class UpdatePromptTests(TestCase):
                 {"title": title, "message": message, **kwargs}
             )
             or {"status": "sent"},
+            record_action_func=lambda action, **kwargs: {"status": "recorded"},
             list_notifications_func=lambda **kwargs: {"notifications": []},
         )
-        monitor._pending_confirmation = True
+        monitor.check_once(reason="prompt")
 
         monitor.handle_notification_action({"action": "HASS_JANITOR_CONFIRM_UPDATE"})
 
@@ -2319,6 +2324,7 @@ class UpdatePromptTests(TestCase):
             initial_states=[state],
         )
         client.install_errors["update.mushroom_update"] = HAResponseError(500, "upstream timeout")
+        client.list_states_sequence = [[state], [state]]
         notifications: list[dict[str, Any]] = []
         monitor = JanitorMonitor(
             self._monitor_config(),
@@ -2327,9 +2333,10 @@ class UpdatePromptTests(TestCase):
                 {"title": title, "message": message, **kwargs}
             )
             or {"status": "sent"},
+            record_action_func=lambda action, **kwargs: {"status": "recorded"},
             list_notifications_func=lambda **kwargs: {"notifications": []},
         )
-        monitor._pending_confirmation = True
+        monitor.check_once(reason="prompt")
 
         monitor.handle_notification_action({"action": "HASS_JANITOR_CONFIRM_UPDATE"})
 

@@ -14,8 +14,8 @@ from typing import Any, Callable
 
 from .audit import append_audit_log
 from .client import HAClientError, HomeAssistantClient
-from .models import RunSummary
-from .runner import UpdateRunner
+from .models import RunSummary, UpdateNotice
+from .runner import SYSTEM_UPDATE_ORDER, UpdateRunner, classify_update
 
 
 LOGGER = logging.getLogger("hass-janitor.monitor")
@@ -25,6 +25,10 @@ DISMISS_ACTION = "HASS_JANITOR_DISMISS_UPDATE"
 UPDATE_CONFIRM_TAG = "hass-janitor-update-confirm"
 UPDATE_GROUP = "hass-janitor"
 SNOOZE_DURATION = timedelta(hours=24)
+OPTIONAL_PREVIEW_LIMIT = 8
+RECOMMENDED_QUESTION = "Is the recommended update needed now, or can it wait?"
+HACS_MARKETPLACE_HINT = "HACS needs its Marketplace warning accepted in the HA UI"
+_SYSTEM_RANK = {entity_id: index for index, entity_id in enumerate(SYSTEM_UPDATE_ORDER)}
 
 
 @dataclass(frozen=True)
@@ -296,11 +300,7 @@ class JanitorMonitor:
         self._mark_recorded_action_processed(record_result)
         self.notify_func(
             "Home Assistant update finished",
-            (
-                f"Processed {summary.attempted_count}/{summary.discovered_count}. "
-                f"Succeeded: {summary.succeeded_count}, failed: {summary.failed_count}, "
-                f"timed out: {summary.timed_out_count}, restart: {summary.restart.result}."
-            ),
+            update_finished_message(summary),
             tag="hass-janitor-update-finished",
             group="hass-janitor",
         )
@@ -378,11 +378,7 @@ class JanitorMonitor:
             self._mark_action_processed(action_id)
             self.notify_func(
                 "Home Assistant update finished",
-                (
-                    f"Processed {summary.attempted_count}/{summary.discovered_count}. "
-                    f"Succeeded: {summary.succeeded_count}, failed: {summary.failed_count}, "
-                    f"timed out: {summary.timed_out_count}, restart: {summary.restart.result}."
-                ),
+                update_finished_message(summary),
                 tag="hass-janitor-update-finished",
                 group="hass-janitor",
             )
@@ -416,11 +412,6 @@ class JanitorMonitor:
         *,
         reason: str,
     ) -> None:
-        update_lines = [
-            f"{attempt.name}: {attempt.from_version} -> {attempt.to_version}"
-            for attempt in summary.updates[:4]
-        ]
-        extra = "" if len(summary.updates) <= 4 else f" +{len(summary.updates) - 4} more"
         signature = confirmation_signature(summary)
         if not self._should_notify(signature):
             return
@@ -431,19 +422,10 @@ class JanitorMonitor:
             return
 
         self._pending_confirmation = True
-        backup_age = (
-            "unknown age"
-            if backup.age_days is None
-            else f"{backup.age_days:.1f} days old"
-        )
+        title, message = render_update_confirmation(summary, backup)
         result = self.notify_func(
-            "Home Assistant updates available",
-            (
-                f"{summary.discovered_count} update(s): "
-                + "; ".join(update_lines)
-                + extra
-                + f". Backup is {backup_age}."
-            ),
+            title,
+            message,
             tag=UPDATE_CONFIRM_TAG,
             group=UPDATE_GROUP,
             url="/config/updates",
@@ -651,13 +633,88 @@ def confirmation_action_token(signature: str) -> str:
     return hashlib.sha256(signature.encode("utf-8")).hexdigest()[:16]
 
 
-def confirmation_signature(summary: RunSummary) -> str:
-    update_lines = [
-        f"{attempt.name}: {attempt.from_version} -> {attempt.to_version}"
-        for attempt in summary.updates[:4]
+def update_notices(summary: RunSummary) -> list[UpdateNotice]:
+    notices = [
+        UpdateNotice(
+            entity_id=attempt.entity_id,
+            name=attempt.name,
+            installed_version=attempt.from_version,
+            latest_version=attempt.to_version,
+            release_url=attempt.release_url,
+            kind=attempt.kind,
+            verdict=classify_update(attempt.kind, attempt.release_summary),
+        )
+        for attempt in summary.updates
     ]
-    extra = "" if len(summary.updates) <= 4 else f" +{len(summary.updates) - 4} more"
-    return "confirm:" + "|".join(update_lines) + extra
+    notices.sort(key=_notice_sort_key)
+    return notices
+
+
+def confirmation_signature(summary: RunSummary) -> str:
+    identity = sorted(
+        f"{item.entity_id}|{item.installed_version}|{item.latest_version}"
+        for item in update_notices(summary)
+    )
+    return "confirm:" + "|".join(identity)
+
+
+def render_update_confirmation(summary: RunSummary, backup: BackupStatus) -> tuple[str, str]:
+    notices = update_notices(summary)
+    recommended = [item for item in notices if item.verdict == "recommended"]
+    optional = [item for item in notices if item.verdict == "optional"]
+    if recommended:
+        title = (
+            "Recommended Home Assistant update"
+            if len(recommended) == 1
+            else "Recommended Home Assistant updates"
+        )
+    elif len(optional) == 1:
+        title = "Optional Home Assistant update"
+    else:
+        title = "Optional Home Assistant updates"
+
+    lines: list[str] = []
+    if recommended:
+        lines.append("Recommended")
+        for item in recommended:
+            line = f"{item.name} {item.installed_version} -> {item.latest_version}"
+            if item.release_url:
+                line += " " + item.release_url
+            lines.append(line)
+    if optional:
+        if lines:
+            lines.append("")
+        lines.append("Optional")
+        shown = optional[:OPTIONAL_PREVIEW_LIMIT]
+        for item in shown:
+            lines.append(f"{item.name} {item.installed_version} -> {item.latest_version}")
+        hidden = len(optional) - len(shown)
+        if hidden:
+            lines.append(f"+{hidden} more optional")
+    if lines:
+        lines.append("")
+    age = "unknown age" if backup.age_days is None else f"{backup.age_days:.1f} days old"
+    lines.append(f"Backup is {age}.")
+    if recommended:
+        lines.append(RECOMMENDED_QUESTION)
+    return title, "\n".join(lines)
+
+
+def update_finished_message(summary: RunSummary) -> str:
+    message = (
+        f"Processed {summary.attempted_count}/{summary.discovered_count}. "
+        f"Succeeded: {summary.succeeded_count}, failed: {summary.failed_count}, "
+        f"timed out: {summary.timed_out_count}, restart: {summary.restart.result}."
+    )
+    if any(attempt.marketplace_warning for attempt in summary.updates):
+        return f"{message}\n{HACS_MARKETPLACE_HINT}"
+    return message
+
+
+def _notice_sort_key(item: UpdateNotice) -> tuple[int, int, str, str]:
+    recommended_first = 0 if item.verdict == "recommended" else 1
+    system_rank = _SYSTEM_RANK.get(item.entity_id, len(_SYSTEM_RANK))
+    return (recommended_first, system_rank, item.name.casefold(), item.entity_id)
 
 
 def split_action_token(action: str) -> tuple[str, str]:
