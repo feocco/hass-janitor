@@ -3,16 +3,36 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import re
 import time
 from typing import Any, Callable, Sequence
 
 from .client import HAAuthError, HAConnectionError, HAResponseError
-from .models import RestartResult, RunSummary, UpdateAttempt, UpdateEntity
+from .models import (
+    RestartResult,
+    RunSummary,
+    UpdateAttempt,
+    UpdateEntity,
+    UpdateKind,
+    UpdateVerdict,
+)
 
 SYSTEM_UPDATE_ORDER = (
     "update.home_assistant_supervisor_update",
     "update.home_assistant_operating_system_update",
     "update.home_assistant_core_update",
+)
+_SYSTEM_KINDS: dict[str, UpdateKind] = {
+    "update.home_assistant_supervisor_update": "supervisor",
+    "update.home_assistant_operating_system_update": "os",
+    "update.home_assistant_core_update": "core",
+}
+_HACS_CATEGORIES = frozenset({"integration", "plugin", "template", "theme"})
+_ADDON_CATEGORIES = frozenset({"addon", "add-on", "add_on"})
+_RECOMMENDED_KINDS = frozenset({"core", "os", "supervisor"})
+_RECOMMENDED_SUMMARY = re.compile(
+    r"\b(?:security|cve|vulnerability|breaking)\b",
+    re.IGNORECASE,
 )
 
 
@@ -36,10 +56,40 @@ def discover_updates(states: Sequence[dict[str, Any]]) -> list[UpdateEntity]:
                 latest_version=_normalize_version(attributes.get("latest_version")),
                 last_changed=state.get("last_changed"),
                 last_updated=state.get("last_updated"),
+                release_url=_optional_text(attributes.get("release_url")),
+                release_summary=_optional_text(attributes.get("release_summary")),
+                auto_update=_optional_bool(attributes.get("auto_update")),
+                kind=update_kind(entity_id, attributes),
             )
         )
 
     return updates
+
+
+def update_kind(entity_id: str, attributes: dict[str, Any]) -> UpdateKind:
+    system_kind = _SYSTEM_KINDS.get(entity_id)
+    if system_kind:
+        return system_kind
+
+    raw_category = attributes.get("category")
+    category = str(raw_category).strip().casefold() if raw_category else ""
+    if category in _ADDON_CATEGORIES:
+        return "addon"
+    if category in _HACS_CATEGORIES:
+        return "hacs"
+
+    picture = str(attributes.get("entity_picture") or "")
+    if picture.startswith("/api/hassio/addons/"):
+        return "addon"
+    return "integration"
+
+
+def classify_update(kind: str, release_summary: str | None) -> UpdateVerdict:
+    if kind in _RECOMMENDED_KINDS:
+        return "recommended"
+    if release_summary and _RECOMMENDED_SUMMARY.search(release_summary):
+        return "recommended"
+    return "optional"
 
 
 def order_updates(updates: Sequence[UpdateEntity]) -> list[UpdateEntity]:
@@ -198,11 +248,8 @@ class UpdateRunner:
             else "Preflight only. Run with --confirm to install."
         )
         summary.updates = [
-            UpdateAttempt(
-                entity_id=update.entity_id,
-                name=update.name,
-                from_version=update.installed_version,
-                to_version=update.latest_version,
+            _attempt(
+                update,
                 result=result,
                 started_at=timestamp,
                 finished_at=timestamp,
@@ -232,15 +279,13 @@ class UpdateRunner:
             )
         except HAResponseError as exc:
             return (
-                UpdateAttempt(
-                    entity_id=update.entity_id,
-                    name=update.name,
-                    from_version=update.installed_version,
-                    to_version=update.latest_version,
+                _attempt(
+                    update,
                     result="failed",
                     started_at=started_at,
                     finished_at=self._now(),
                     notes=f"Install request failed: {exc}",
+                    marketplace_warning=_marketplace_warning(exc),
                 ),
                 False,
             )
@@ -258,11 +303,8 @@ class UpdateRunner:
                 continue
             except HAResponseError as exc:
                 return (
-                    UpdateAttempt(
-                        entity_id=update.entity_id,
-                        name=update.name,
-                        from_version=update.installed_version,
-                        to_version=update.latest_version,
+                    _attempt(
+                        update,
                         result="failed",
                         started_at=started_at,
                         finished_at=self._now(),
@@ -277,11 +319,8 @@ class UpdateRunner:
 
             if current_status == "off":
                 return (
-                    UpdateAttempt(
-                        entity_id=update.entity_id,
-                        name=update.name,
-                        from_version=update.installed_version,
-                        to_version=update.latest_version,
+                    _attempt(
+                        update,
                         result="success",
                         started_at=started_at,
                         finished_at=self._now(),
@@ -292,11 +331,8 @@ class UpdateRunner:
 
             if current_installed == update.latest_version:
                 return (
-                    UpdateAttempt(
-                        entity_id=update.entity_id,
-                        name=update.name,
-                        from_version=update.installed_version,
-                        to_version=update.latest_version,
+                    _attempt(
+                        update,
                         result="success",
                         started_at=started_at,
                         finished_at=self._now(),
@@ -311,11 +347,8 @@ class UpdateRunner:
             )
 
         return (
-            UpdateAttempt(
-                entity_id=update.entity_id,
-                name=update.name,
-                from_version=update.installed_version,
-                to_version=update.latest_version,
+            _attempt(
+                update,
                 result="timed_out",
                 started_at=started_at,
                 finished_at=self._now(),
@@ -385,11 +418,8 @@ class UpdateRunner:
     def _failed_attempt(
         self, update: UpdateEntity, *, started_at: datetime, notes: str
     ) -> UpdateAttempt:
-        return UpdateAttempt(
-            entity_id=update.entity_id,
-            name=update.name,
-            from_version=update.installed_version,
-            to_version=update.latest_version,
+        return _attempt(
+            update,
             result="failed",
             started_at=started_at,
             finished_at=self._now(),
@@ -407,6 +437,36 @@ class UpdateRunner:
         return 0
 
 
+def _attempt(
+    update: UpdateEntity,
+    *,
+    result: str,
+    started_at: datetime,
+    finished_at: datetime,
+    notes: str,
+    marketplace_warning: bool = False,
+) -> UpdateAttempt:
+    return UpdateAttempt(
+        entity_id=update.entity_id,
+        name=update.name,
+        from_version=update.installed_version,
+        to_version=update.latest_version,
+        result=result,
+        started_at=started_at,
+        finished_at=finished_at,
+        notes=notes,
+        release_url=update.release_url,
+        release_summary=update.release_summary,
+        auto_update=update.auto_update,
+        kind=update.kind,
+        marketplace_warning=marketplace_warning,
+    )
+
+
+def _marketplace_warning(exc: HAResponseError) -> bool:
+    return "open the marketplace and read the warning" in exc.message.casefold()
+
+
 def _display_name(entity_id: str, attributes: dict[str, Any]) -> str:
     title = attributes.get("title")
     if title:
@@ -422,3 +482,16 @@ def _normalize_version(value: Any) -> str:
         return "-"
     text = str(value).strip()
     return text or "-"
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    return None

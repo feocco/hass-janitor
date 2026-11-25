@@ -23,6 +23,7 @@ from hass_janitor.monitor import (
     MonitorConfig,
     SNOOZE_ACTION,
     confirmation_action_token,
+    confirmation_signature,
     parse_ha_datetime,
     summarize_update_event,
     update_event_signature,
@@ -40,6 +41,11 @@ def build_state(
     friendly_name: str | None = None,
     installed_version: str | None = None,
     latest_version: str | None = None,
+    release_url: str | None = None,
+    release_summary: str | None = None,
+    auto_update: bool | None = None,
+    category: str | None = None,
+    entity_picture: str | None = None,
 ) -> dict[str, Any]:
     attributes: dict[str, Any] = {}
     if title is not None:
@@ -50,6 +56,16 @@ def build_state(
         attributes["installed_version"] = installed_version
     if latest_version is not None:
         attributes["latest_version"] = latest_version
+    if release_url is not None:
+        attributes["release_url"] = release_url
+    if release_summary is not None:
+        attributes["release_summary"] = release_summary
+    if auto_update is not None:
+        attributes["auto_update"] = auto_update
+    if category is not None:
+        attributes["category"] = category
+    if entity_picture is not None:
+        attributes["entity_picture"] = entity_picture
 
     return {
         "entity_id": entity_id,
@@ -58,6 +74,27 @@ def build_state(
         "last_changed": "2026-04-18T18:00:00-04:00",
         "last_updated": "2026-04-18T18:00:00-04:00",
     }
+
+
+def confirmation_token(entity_id: str, name: str, installed: str, latest: str) -> str:
+    timestamp = datetime(2026, 11, 24, tzinfo=timezone.utc)
+    summary = RunSummary(
+        started_at=timestamp,
+        finished_at=timestamp,
+        base_url="https://example.ui.nabu.casa",
+        updates=[
+            UpdateAttempt(
+                entity_id=entity_id,
+                name=name,
+                from_version=installed,
+                to_version=latest,
+                result="planned",
+                started_at=timestamp,
+                finished_at=timestamp,
+            )
+        ],
+    )
+    return confirmation_action_token(confirmation_signature(summary))
 
 
 class FakeClock:
@@ -1225,7 +1262,12 @@ class MonitorTests(TestCase):
             installed_version="2026.5.4",
             latest_version="2026.6.4",
         )
-        token = confirmation_action_token("confirm:Home Assistant Core: 2026.5.4 -> 2026.6.4")
+        token = confirmation_token(
+            "update.home_assistant_core_update",
+            "Home Assistant Core",
+            "2026.5.4",
+            "2026.6.4",
+        )
         client = MonitorFakeClient(
             backup_state=datetime.now(timezone.utc).isoformat(),
             initial_states=[update_state],
@@ -1356,7 +1398,12 @@ class MonitorTests(TestCase):
             installed_version="2026.5.4",
             latest_version="2026.6.4",
         )
-        token = confirmation_action_token("confirm:Home Assistant Core: 2026.5.4 -> 2026.6.4")
+        token = confirmation_token(
+            "update.home_assistant_core_update",
+            "Home Assistant Core",
+            "2026.5.4",
+            "2026.6.4",
+        )
         client = MonitorFakeClient(
             backup_state="2026-05-01T04:00:00+00:00",
             initial_states=[update_state],
@@ -1435,7 +1482,12 @@ class MonitorTests(TestCase):
             installed_version="2026.5.4",
             latest_version="2026.6.4",
         )
-        token = confirmation_action_token("confirm:Home Assistant Core: 2026.5.4 -> 2026.6.4")
+        token = confirmation_token(
+            "update.home_assistant_core_update",
+            "Home Assistant Core",
+            "2026.5.4",
+            "2026.6.4",
+        )
         preflight_summary = RunSummary(
             started_at=datetime.now(timezone.utc),
             finished_at=datetime.now(timezone.utc),
@@ -1559,7 +1611,11 @@ class MonitorTests(TestCase):
         summary = monitor.check_once(reason="test")
 
         self.assertEqual(summary.discovered_count, 1)
-        self.assertEqual(notifications[0]["title"], "Home Assistant updates available")
+        self.assertEqual(notifications[0]["title"], "Recommended Home Assistant update")
+        self.assertIn(
+            "Is the recommended update needed now, or can it wait?",
+            notifications[0]["message"],
+        )
         self.assertEqual(notifications[0]["buttons"][0]["title"], "Update now")
         self.assertEqual(notifications[0]["buttons"][1]["title"], "Snooze 24h")
         self.assertEqual(notifications[0]["buttons"][2]["title"], "Dismiss this version")
@@ -1574,8 +1630,12 @@ class MonitorTests(TestCase):
             installed_version="2026.2.1",
             latest_version="2026.4.4",
         )
-        update_line = "Home Assistant Core: 2026.2.1 -> 2026.4.4"
-        token = confirmation_action_token(f"confirm:{update_line}")
+        token = confirmation_token(
+            "update.home_assistant_core_update",
+            "Home Assistant Core",
+            "2026.2.1",
+            "2026.4.4",
+        )
         client = MonitorFakeClient(
             backup_state=datetime.now(timezone.utc).isoformat(),
             initial_states=[update_state],
@@ -1615,8 +1675,12 @@ class MonitorTests(TestCase):
             installed_version="2026.2.1",
             latest_version="2026.4.4",
         )
-        update_line = "Home Assistant Core: 2026.2.1 -> 2026.4.4"
-        token = confirmation_action_token(f"confirm:{update_line}")
+        token = confirmation_token(
+            "update.home_assistant_core_update",
+            "Home Assistant Core",
+            "2026.2.1",
+            "2026.4.4",
+        )
         client = MonitorFakeClient(
             backup_state=datetime.now(timezone.utc).isoformat(),
             initial_states=[update_state],
@@ -1763,6 +1827,581 @@ class ListenerRefactorTests(IsolatedAsyncioTestCase):
             [{"entity_id": "update.example", "new_state": {"state": "off"}}],
         )
         self.assertEqual(action_events, [{"action": "HASS_JANITOR_CANARY::token"}])
+
+    def _monitor_config(self) -> MonitorConfig:
+        return MonitorConfig(
+            ha_base_url="https://example.ui.nabu.casa",
+            ha_token="ha-token",
+            audit_path=Path(os.devnull),
+            backup_entity_id="event.backup_automatic_backup",
+            backup_max_age_days=7,
+            check_interval_seconds=86400,
+            notification_cooldown_seconds=21600,
+        )
+
+
+CORE_RELEASE_URL = "https://www.home-assistant.io/latest-release-notes/"
+NOV24_MESSAGE = (
+    "Recommended\n"
+    "Home Assistant Core 2026.11.2 -> 2026.11.3 "
+    f"{CORE_RELEASE_URL}\n"
+    "\n"
+    "Optional\n"
+    "Bambu Lab v2.2.26 -> v2.4.1\n"
+    "Better Thermostat UI 3.3.0 -> 3.4.0\n"
+    "Mushroom v5.2.3 -> v5.3.0\n"
+    "TryFi Dog Monitor 0.0.26 -> v0.1.1\n"
+    "xAI Grok v1.11.1 -> v1.11.2\n"
+    "\n"
+    "Backup is 1.5 days old.\n"
+    "Is the recommended update needed now, or can it wait?"
+)
+HACS_MARKETPLACE_HINT = "HACS needs its Marketplace warning accepted in the HA UI"
+HACS_MARKETPLACE_ERROR = (
+    "Open the Marketplace and read the warning first, installing and "
+    "updating work once it is accepted."
+)
+
+
+def nov24_states() -> list[dict[str, Any]]:
+    return [
+        build_state(
+            "update.bambu_lab_update",
+            "on",
+            title="Bambu Lab",
+            installed_version="v2.2.26",
+            latest_version="v2.4.1",
+            release_url="https://github.com/greghesp/ha-bambulab/releases/tag/v2.4.1",
+            release_summary="New features.",
+            auto_update=False,
+        ),
+        build_state(
+            "update.better_thermostat_ui_update",
+            "on",
+            title="Better Thermostat UI",
+            installed_version="3.3.0",
+            latest_version="3.4.0",
+            release_summary="UI tweaks.",
+        ),
+        build_state(
+            "update.mushroom_update",
+            "on",
+            title="Mushroom",
+            installed_version="v5.2.3",
+            latest_version="v5.3.0",
+            category="plugin",
+        ),
+        build_state(
+            "update.tryfi_dog_monitor_update",
+            "on",
+            title="TryFi Dog Monitor",
+            installed_version="0.0.26",
+            latest_version="v0.1.1",
+        ),
+        build_state(
+            "update.xai_grok_update",
+            "on",
+            title="xAI Grok",
+            installed_version="v1.11.1",
+            latest_version="v1.11.2",
+        ),
+        build_state(
+            "update.home_assistant_core_update",
+            "on",
+            title="Home Assistant Core",
+            installed_version="2026.11.2",
+            latest_version="2026.11.3",
+            release_url=CORE_RELEASE_URL,
+            release_summary="Bug fixes.",
+            auto_update=False,
+        ),
+    ]
+
+
+class UpdatePromptTests(TestCase):
+    def test_classify_update_names_recommended_or_optional(self) -> None:
+        from hass_janitor.runner import classify_update
+
+        self.assertEqual(classify_update("core", None), "recommended")
+        self.assertEqual(classify_update("os", ""), "recommended")
+        self.assertEqual(classify_update("supervisor", "routine bump"), "recommended")
+        self.assertEqual(classify_update("addon", None), "optional")
+        self.assertEqual(classify_update("hacs", None), "optional")
+        self.assertEqual(classify_update("integration", None), "optional")
+        self.assertEqual(classify_update("integration", "Security patch"), "recommended")
+        self.assertEqual(
+            classify_update("hacs", "Fixes CVE-2026-1000 in the parser"),
+            "recommended",
+        )
+        self.assertEqual(
+            classify_update("integration", "This release has a vulnerability"),
+            "recommended",
+        )
+        self.assertEqual(
+            classify_update("addon", "This is a breaking change"),
+            "recommended",
+        )
+        self.assertEqual(classify_update("integration", "unbreaking"), "optional")
+        self.assertEqual(classify_update("integration", "insecure default"), "optional")
+        self.assertEqual(classify_update("integration", "automatic"), "optional")
+        self.assertNotEqual(classify_update("core", "must install"), "required")
+
+    def test_update_kind_uses_system_ids_addon_icon_and_category(self) -> None:
+        from hass_janitor.runner import update_kind
+
+        self.assertEqual(
+            update_kind("update.home_assistant_core_update", {"category": "plugin"}),
+            "core",
+        )
+        self.assertEqual(
+            update_kind("update.home_assistant_operating_system_update", {}),
+            "os",
+        )
+        self.assertEqual(
+            update_kind("update.home_assistant_supervisor_update", {}),
+            "supervisor",
+        )
+        self.assertEqual(
+            update_kind(
+                "update.mosquitto_broker_update",
+                {"entity_picture": "/api/hassio/addons/core_mosquitto/icon"},
+            ),
+            "addon",
+        )
+        self.assertEqual(update_kind("update.mushroom_update", {"category": "plugin"}), "hacs")
+        self.assertEqual(
+            update_kind("update.bambu_lab_update", {"category": "Integration"}),
+            "hacs",
+        )
+        self.assertEqual(update_kind("update.theme_update", {"category": "theme"}), "hacs")
+        self.assertEqual(update_kind("update.template_update", {"category": "template"}), "hacs")
+        self.assertEqual(
+            update_kind("update.studio_code_server_update", {"category": "add-on"}),
+            "addon",
+        )
+        self.assertEqual(update_kind("update.zigbee_firmware", {}), "integration")
+        self.assertEqual(
+            update_kind(
+                "update.other",
+                {"entity_picture": "/api/brands/integration/homeassistant/icon.png"},
+            ),
+            "integration",
+        )
+
+    def test_discover_updates_keeps_release_fields_and_kind(self) -> None:
+        updates = discover_updates(nov24_states())
+        by_id = {item.entity_id: item for item in updates}
+
+        core = by_id["update.home_assistant_core_update"]
+        self.assertEqual(core.release_url, CORE_RELEASE_URL)
+        self.assertEqual(core.release_summary, "Bug fixes.")
+        self.assertIs(core.auto_update, False)
+        self.assertEqual(core.kind, "core")
+
+        bambu = by_id["update.bambu_lab_update"]
+        self.assertEqual(
+            bambu.release_url,
+            "https://github.com/greghesp/ha-bambulab/releases/tag/v2.4.1",
+        )
+        self.assertEqual(bambu.release_summary, "New features.")
+        self.assertIs(bambu.auto_update, False)
+        self.assertEqual(bambu.kind, "integration")
+
+        mushroom = by_id["update.mushroom_update"]
+        self.assertEqual(mushroom.kind, "hacs")
+        self.assertIsNone(mushroom.release_url)
+        self.assertIsNone(mushroom.auto_update)
+
+        summary = UpdateRunner(
+            FakeClient(initial_states=nov24_states()),
+            base_url="https://example.ui.nabu.casa",
+        ).preflight()
+        core_attempt = next(
+            attempt
+            for attempt in summary.updates
+            if attempt.entity_id == "update.home_assistant_core_update"
+        )
+        self.assertEqual(core_attempt.release_url, CORE_RELEASE_URL)
+        self.assertEqual(core_attempt.release_summary, "Bug fixes.")
+        self.assertIs(core_attempt.auto_update, False)
+        self.assertEqual(core_attempt.kind, "core")
+
+    def test_confirmation_signature_covers_every_update_and_ignores_wording(self) -> None:
+        from dataclasses import replace
+
+        summary = UpdateRunner(
+            FakeClient(initial_states=nov24_states()),
+            base_url="https://example.ui.nabu.casa",
+        ).preflight()
+
+        signature = confirmation_signature(summary)
+        flipped = replace(summary, updates=list(reversed(summary.updates)))
+        self.assertEqual(signature, confirmation_signature(flipped))
+        self.assertEqual(
+            signature,
+            "confirm:"
+            + "|".join(
+                [
+                    "update.bambu_lab_update|v2.2.26|v2.4.1",
+                    "update.better_thermostat_ui_update|3.3.0|3.4.0",
+                    "update.home_assistant_core_update|2026.11.2|2026.11.3",
+                    "update.mushroom_update|v5.2.3|v5.3.0",
+                    "update.tryfi_dog_monitor_update|0.0.26|v0.1.1",
+                    "update.xai_grok_update|v1.11.1|v1.11.2",
+                ]
+            ),
+        )
+        self.assertNotIn("->", signature)
+        self.assertNotIn("more", signature)
+        self.assertNotIn("recommended", signature)
+        self.assertNotIn("Backup", signature)
+
+    def test_nov24_confirmation_shows_core_release_notes_and_keeps_buttons(self) -> None:
+        notifications: list[dict[str, Any]] = []
+        client = MonitorFakeClient(
+            backup_state="2026-11-23T12:00:00+00:00",
+            initial_states=nov24_states(),
+        )
+        monitor = JanitorMonitor(
+            self._monitor_config(),
+            client_factory=lambda: client,
+            notify_func=lambda title, message, **kwargs: notifications.append(
+                {"title": title, "message": message, **kwargs}
+            )
+            or {"status": "sent", "notification_id": 7},
+            list_notifications_func=lambda **kwargs: {"notifications": []},
+        )
+
+        monitor.check_once(reason="nov24")
+
+        self.assertEqual(len(notifications), 1)
+        message = notifications[0]["message"]
+        self.assertIn(
+            f"Home Assistant Core 2026.11.2 -> 2026.11.3 {CORE_RELEASE_URL}",
+            message,
+        )
+        self.assertIn("xAI Grok v1.11.1 -> v1.11.2", message)
+        self.assertIn("Is the recommended update needed now, or can it wait?", message)
+        self.assertIn("Backup is", message)
+        self.assertNotIn(" more", message)
+        self.assertNotIn("required", message.casefold())
+        self.assertLess(
+            message.index("Home Assistant Core"),
+            message.index("Bambu Lab"),
+        )
+        buttons = notifications[0]["buttons"]
+        self.assertEqual(
+            [button["title"] for button in buttons],
+            ["Update now", "Snooze 24h", "Dismiss this version"],
+        )
+        self.assertEqual(
+            [button["action"].split("::", 1)[0] for button in buttons],
+            [
+                "HASS_JANITOR_CONFIRM_UPDATE",
+                "HASS_JANITOR_SNOOZE_UPDATE",
+                "HASS_JANITOR_DISMISS_UPDATE",
+            ],
+        )
+        self.assertEqual(len({button["action"].split("::", 1)[1] for button in buttons}), 1)
+
+    def test_nov24_rendered_sample_matches_the_structured_prompt(self) -> None:
+        from hass_janitor.monitor import BackupStatus, render_update_confirmation
+
+        summary = UpdateRunner(
+            FakeClient(initial_states=nov24_states()),
+            base_url="https://example.ui.nabu.casa",
+        ).preflight()
+        backup = BackupStatus(
+            fresh=True,
+            entity_id="event.backup_automatic_backup",
+            state="2026-11-23T12:00:00+00:00",
+            checked_at=datetime(2026, 11, 25, tzinfo=timezone.utc),
+            age_days=1.5,
+            reason="Backup is fresh.",
+        )
+
+        title, message = render_update_confirmation(summary, backup)
+
+        self.assertEqual(title, "Recommended Home Assistant update")
+        self.assertEqual(message, NOV24_MESSAGE)
+
+    def test_optional_overflow_hides_only_optional_items(self) -> None:
+        from hass_janitor.monitor import BackupStatus, render_update_confirmation
+
+        states = [
+            build_state(
+                f"update.addon_{index}",
+                "on",
+                title=f"Addon {index}",
+                installed_version="1.0.0",
+                latest_version="1.1.0",
+            )
+            for index in range(1, 10)
+        ]
+        states.append(
+            build_state(
+                "update.home_assistant_core_update",
+                "on",
+                title="Home Assistant Core",
+                installed_version="2026.11.2",
+                latest_version="2026.11.3",
+                release_url=CORE_RELEASE_URL,
+            )
+        )
+        summary = UpdateRunner(
+            FakeClient(initial_states=states),
+            base_url="https://example.ui.nabu.casa",
+        ).preflight()
+        _title, message = render_update_confirmation(
+            summary,
+            BackupStatus(
+                fresh=True,
+                entity_id="event.backup_automatic_backup",
+                state="fresh",
+                checked_at=datetime(2026, 11, 25, tzinfo=timezone.utc),
+                age_days=1.0,
+                reason="Backup is fresh.",
+            ),
+        )
+
+        self.assertIn("Home Assistant Core 2026.11.2 -> 2026.11.3", message)
+        self.assertIn("Addon 8 1.0.0 -> 1.1.0", message)
+        self.assertNotIn("Addon 9 1.0.0 -> 1.1.0", message)
+        self.assertIn("+1 more optional", message)
+        self.assertLess(message.index("Home Assistant Core"), message.index("Addon 1"))
+
+    def test_recommended_line_keeps_the_full_release_url(self) -> None:
+        from hass_janitor.monitor import BackupStatus, render_update_confirmation
+
+        long_url = (
+            "https://github.com/example-org/a-very-long-repository-name-for-notes"
+            "/releases/tag/v9.9.9"
+        )
+        summary = UpdateRunner(
+            FakeClient(
+                initial_states=[
+                    build_state(
+                        "update.security_plugin",
+                        "on",
+                        title="Security Plugin",
+                        installed_version="1.0.0",
+                        latest_version="1.1.0",
+                        release_url=long_url,
+                        release_summary="Fixes a CVE in the parser.",
+                        category="plugin",
+                    )
+                ]
+            ),
+            base_url="https://example.ui.nabu.casa",
+        ).preflight()
+        title, message = render_update_confirmation(
+            summary,
+            BackupStatus(
+                fresh=True,
+                entity_id="event.backup_automatic_backup",
+                state="fresh",
+                checked_at=datetime(2026, 11, 25, tzinfo=timezone.utc),
+                age_days=0.5,
+                reason="Backup is fresh.",
+            ),
+        )
+
+        self.assertEqual(title, "Recommended Home Assistant update")
+        self.assertIn(long_url, message)
+        self.assertIn("Is the recommended update needed now, or can it wait?", message)
+
+    def test_optional_only_prompt_does_not_ask_about_a_recommended_update(self) -> None:
+        from hass_janitor.monitor import BackupStatus, render_update_confirmation
+
+        summary = UpdateRunner(
+            FakeClient(
+                initial_states=[
+                    build_state(
+                        "update.mushroom_update",
+                        "on",
+                        title="Mushroom",
+                        installed_version="v5.2.3",
+                        latest_version="v5.3.0",
+                        release_url="https://github.com/piitaya/lovelace-mushroom/releases/tag/v5.3.0",
+                        release_summary="New cards.",
+                    )
+                ]
+            ),
+            base_url="https://example.ui.nabu.casa",
+        ).preflight()
+        title, message = render_update_confirmation(
+            summary,
+            BackupStatus(
+                fresh=True,
+                entity_id="event.backup_automatic_backup",
+                state="fresh",
+                checked_at=datetime(2026, 11, 25, tzinfo=timezone.utc),
+                age_days=None,
+                reason="Backup is fresh.",
+            ),
+        )
+
+        self.assertEqual(title, "Optional Home Assistant update")
+        self.assertIn("Mushroom v5.2.3 -> v5.3.0", message)
+        self.assertNotIn("github.com", message)
+        self.assertNotIn("Is the recommended update needed now", message)
+        self.assertIn("Backup is unknown age.", message)
+
+    def test_same_update_set_stays_inside_the_six_hour_cooldown(self) -> None:
+        states = nov24_states()
+        notifications: list[dict[str, Any]] = []
+        client = MonitorFakeClient(
+            backup_state=datetime.now(timezone.utc).isoformat(),
+            initial_states=states,
+        )
+        client.list_states_sequence = [states, states]
+        monitor = JanitorMonitor(
+            self._monitor_config(),
+            client_factory=lambda: client,
+            notify_func=lambda title, message, **kwargs: notifications.append(
+                {"title": title, "message": message, **kwargs}
+            )
+            or {"status": "sent"},
+            list_notifications_func=lambda **kwargs: {"notifications": []},
+        )
+
+        monitor.check_once(reason="first")
+        monitor.check_once(reason="second")
+
+        self.assertEqual(len(notifications), 1)
+
+    def test_finished_message_hints_when_marketplace_warning_blocks_install(self) -> None:
+        state = build_state(
+            "update.mushroom_update",
+            "on",
+            title="Mushroom",
+            installed_version="v5.2.3",
+            latest_version="v5.3.0",
+        )
+        client = MonitorFakeClient(
+            backup_state=datetime.now(timezone.utc).isoformat(),
+            initial_states=[state],
+        )
+        client.install_errors["update.mushroom_update"] = HAResponseError(
+            500,
+            HACS_MARKETPLACE_ERROR,
+        )
+        client.list_states_sequence = [[state], [state]]
+        notifications: list[dict[str, Any]] = []
+        monitor = JanitorMonitor(
+            self._monitor_config(),
+            client_factory=lambda: client,
+            notify_func=lambda title, message, **kwargs: notifications.append(
+                {"title": title, "message": message, **kwargs}
+            )
+            or {"status": "sent"},
+            record_action_func=lambda action, **kwargs: {"status": "recorded"},
+            list_notifications_func=lambda **kwargs: {"notifications": []},
+        )
+        monitor.check_once(reason="prompt")
+
+        monitor.handle_notification_action({"action": "HASS_JANITOR_CONFIRM_UPDATE"})
+
+        finished = [
+            item for item in notifications if item["title"] == "Home Assistant update finished"
+        ]
+        self.assertEqual(len(finished), 1)
+        self.assertIn("Processed 1/1.", finished[0]["message"])
+        self.assertIn("failed: 1", finished[0]["message"])
+        self.assertEqual(finished[0]["message"].count(HACS_MARKETPLACE_HINT), 1)
+        self.assertEqual(client.install_calls, ["update.mushroom_update"])
+
+    def test_finished_message_leaves_other_install_errors_alone(self) -> None:
+        state = build_state(
+            "update.mushroom_update",
+            "on",
+            title="Mushroom",
+            installed_version="v5.2.3",
+            latest_version="v5.3.0",
+        )
+        client = MonitorFakeClient(
+            backup_state=datetime.now(timezone.utc).isoformat(),
+            initial_states=[state],
+        )
+        client.install_errors["update.mushroom_update"] = HAResponseError(500, "upstream timeout")
+        client.list_states_sequence = [[state], [state]]
+        notifications: list[dict[str, Any]] = []
+        monitor = JanitorMonitor(
+            self._monitor_config(),
+            client_factory=lambda: client,
+            notify_func=lambda title, message, **kwargs: notifications.append(
+                {"title": title, "message": message, **kwargs}
+            )
+            or {"status": "sent"},
+            record_action_func=lambda action, **kwargs: {"status": "recorded"},
+            list_notifications_func=lambda **kwargs: {"notifications": []},
+        )
+        monitor.check_once(reason="prompt")
+
+        monitor.handle_notification_action({"action": "HASS_JANITOR_CONFIRM_UPDATE"})
+
+        finished = [
+            item for item in notifications if item["title"] == "Home Assistant update finished"
+        ]
+        self.assertEqual(len(finished), 1)
+        self.assertNotIn(HACS_MARKETPLACE_HINT, finished[0]["message"])
+        self.assertEqual(client.install_calls, ["update.mushroom_update"])
+
+    def test_ledger_finished_message_uses_the_same_marketplace_hint(self) -> None:
+        state = build_state(
+            "update.mushroom_update",
+            "on",
+            title="Mushroom",
+            installed_version="v5.2.3",
+            latest_version="v5.3.0",
+        )
+        client = MonitorFakeClient(
+            backup_state=datetime.now(timezone.utc).isoformat(),
+            initial_states=[state],
+        )
+        client.install_errors["update.mushroom_update"] = HAResponseError(
+            500,
+            f"HTTP body: {HACS_MARKETPLACE_ERROR}",
+        )
+        preflight = UpdateRunner(client, base_url="https://example.ui.nabu.casa").preflight()
+        client.list_states_sequence = [[state], [state]]
+        token = confirmation_action_token(confirmation_signature(preflight))
+        notifications: list[dict[str, Any]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            monitor = JanitorMonitor(
+                MonitorConfig(
+                    **{
+                        **self._monitor_config().__dict__,
+                        "action_state_path": Path(tmpdir) / "actions.json",
+                    }
+                ),
+                client_factory=lambda: client,
+                notify_func=lambda title, message, **kwargs: notifications.append(
+                    {"title": title, "message": message, **kwargs}
+                )
+                or {"status": "sent"},
+                list_notifications_func=lambda **kwargs: {
+                    "notifications": [
+                        {
+                            "actions": [
+                                {
+                                    "id": 55,
+                                    "created_at": datetime.now(timezone.utc).isoformat(),
+                                    "action": f"HASS_JANITOR_CONFIRM_UPDATE::{token}",
+                                }
+                            ]
+                        }
+                    ]
+                },
+            )
+            monitor.process_ledger_actions()
+
+        finished = [
+            item for item in notifications if item["title"] == "Home Assistant update finished"
+        ]
+        self.assertEqual(len(finished), 1)
+        self.assertIn(HACS_MARKETPLACE_HINT, finished[0]["message"])
+        self.assertEqual(client.install_calls, ["update.mushroom_update"])
 
     def _monitor_config(self) -> MonitorConfig:
         return MonitorConfig(

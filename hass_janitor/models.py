@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Literal
+
+
+UpdateKind = Literal["core", "os", "supervisor", "addon", "hacs", "integration"]
+UpdateVerdict = Literal["recommended", "optional"]
 
 
 @dataclass(frozen=True)
@@ -16,6 +21,10 @@ class UpdateEntity:
     latest_version: str
     last_changed: str | None = None
     last_updated: str | None = None
+    release_url: str | None = None
+    release_summary: str | None = None
+    auto_update: bool | None = None
+    kind: UpdateKind = "integration"
 
 
 @dataclass
@@ -30,6 +39,22 @@ class UpdateAttempt:
     started_at: datetime
     finished_at: datetime
     notes: str = ""
+    release_url: str | None = None
+    release_summary: str | None = None
+    auto_update: bool | None = None
+    kind: UpdateKind = "integration"
+    marketplace_warning: bool = False
+
+
+@dataclass(frozen=True)
+class UpdateNotice:
+    entity_id: str
+    name: str
+    installed_version: str
+    latest_version: str
+    release_url: str | None
+    kind: UpdateKind
+    verdict: UpdateVerdict
 
 
 @dataclass
